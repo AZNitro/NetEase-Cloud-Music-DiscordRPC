@@ -21,6 +21,52 @@ use crate::pattern::{find_pattern_in, parse_signature};
 /// `.text\0\0\0` read as a little-endian i64.
 const DOT_TEXT: i64 = 0x0074_7865_742E;
 
+/// How a playback-clock value is encoded in memory. Different NetEase builds use
+/// different types/units, so [`ProcessMemory::find_playback_clock`] tries them all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClockFormat {
+    F64Sec,
+    F64Ms,
+    F32Sec,
+    F32Ms,
+    I32Ms,
+}
+
+const CLOCK_FORMATS: [ClockFormat; 5] = [
+    ClockFormat::F64Sec,
+    ClockFormat::F64Ms,
+    ClockFormat::F32Sec,
+    ClockFormat::F32Ms,
+    ClockFormat::I32Ms,
+];
+
+/// Interpret the bytes at `buf[i..]` as `fmt`, returning the value in seconds.
+fn extract_seconds(buf: &[u8], i: usize, fmt: ClockFormat) -> Option<f64> {
+    match fmt {
+        ClockFormat::F64Sec | ClockFormat::F64Ms => {
+            let b = buf.get(i..i + 8)?;
+            let v = f64::from_le_bytes(b.try_into().ok()?);
+            if !v.is_finite() {
+                return None;
+            }
+            Some(if fmt == ClockFormat::F64Ms { v / 1000.0 } else { v })
+        }
+        ClockFormat::F32Sec | ClockFormat::F32Ms => {
+            let b = buf.get(i..i + 4)?;
+            let v = f32::from_le_bytes(b.try_into().ok()?) as f64;
+            if !v.is_finite() {
+                return None;
+            }
+            Some(if fmt == ClockFormat::F32Ms { v / 1000.0 } else { v })
+        }
+        ClockFormat::I32Ms => {
+            let b = buf.get(i..i + 4)?;
+            let v = i32::from_le_bytes(b.try_into().ok()?) as f64;
+            Some(v / 1000.0)
+        }
+    }
+}
+
 /// A readable handle to another process. Closes the handle on drop.
 pub struct ProcessMemory {
     handle: windows_sys::Win32::Foundation::HANDLE,
@@ -116,11 +162,29 @@ impl ProcessMemory {
         buf
     }
 
+    /// Read a clock value, in seconds, under a given numeric format.
+    pub fn read_clock_seconds(&self, addr: usize, fmt: ClockFormat) -> Option<f64> {
+        match fmt {
+            ClockFormat::F64Sec => self.read_f64(addr).ok(),
+            ClockFormat::F64Ms => self.read_f64(addr).ok().map(|v| v / 1000.0),
+            ClockFormat::F32Sec => self.read_f32(addr).ok().map(|v| v as f64),
+            ClockFormat::F32Ms => self.read_f32(addr).ok().map(|v| v as f64 / 1000.0),
+            ClockFormat::I32Ms => self.read_i32(addr).ok().map(|v| v as f64 / 1000.0),
+        }
+    }
+
     /// Auto-discover the playback-position "clock" without any version-specific
-    /// offset: a `double` within `[0, duration]` that advances ~1.0 per real
-    /// second. Returns its absolute address. Requires the song to be **playing**
-    /// during the ~2.4s scan; returns `None` if nothing behaves like a clock.
-    pub fn find_playback_clock(&self, base: usize, size: usize, duration: f64) -> Option<usize> {
+    /// offset: a value that, read as some common numeric format, sits within
+    /// `[0, duration]` seconds and advances ~1.0 per real second. Tries `double`,
+    /// `float`, and `int32`, in both seconds and milliseconds. Returns the address
+    /// and the format that fit. Requires the song to be **playing** during the
+    /// ~2.4s scan; returns `None` if nothing behaves like a clock.
+    pub fn find_playback_clock(
+        &self,
+        base: usize,
+        size: usize,
+        duration: f64,
+    ) -> Option<(usize, ClockFormat)> {
         let dur_max = if duration > 0.0 { duration + 2.0 } else { 100_000.0 };
         crate::diag!(
             "[clock] scanning 0x{base:X}..+0x{size:X} for a playback clock (duration={duration:.1})"
@@ -132,57 +196,64 @@ impl ProcessMemory {
         let b = self.read_region_best_effort(base, size);
         let dt = t0.elapsed().as_secs_f64();
 
+        let advances = |sa: f64, sb: f64, dt: f64| {
+            sa >= 0.0 && sa <= dur_max && (sb - sa) > 0.0 && ((sb - sa) - dt).abs() < dt * 0.4
+        };
+
         let limit = a.len().min(b.len());
-        let mut candidates = Vec::new();
+        let mut candidates: Vec<(usize, ClockFormat)> = Vec::new();
+        let mut per_format = [0usize; CLOCK_FORMATS.len()];
         let mut i = 0usize;
-        while i + 8 <= limit {
-            let va = f64::from_le_bytes(a[i..i + 8].try_into().unwrap());
-            let vb = f64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-            if va.is_finite() && vb.is_finite() && va >= 0.0 && va <= dur_max {
-                let delta = vb - va;
-                if delta > 0.0 && (delta - dt).abs() < dt * 0.4 {
-                    candidates.push(base + i);
-                }
-            }
-            i += 4; // doubles are at least 4-byte aligned in a 32-bit image
-        }
-        crate::diag!("[clock] round 1: {} candidate(s) (dt={dt:.2}s)", candidates.len());
-
-        match candidates.len() {
-            0 => None,
-            1 => {
-                crate::diag!("[clock] schedule found at 0x{:X}", candidates[0]);
-                Some(candidates[0])
-            }
-            _ => {
-                // Disambiguate with a second timed round.
-                let before: Vec<f64> = candidates
-                    .iter()
-                    .map(|&a| self.read_f64(a).unwrap_or(f64::NAN))
-                    .collect();
-                let t1 = Instant::now();
-                sleep(Duration::from_millis(1200));
-                let dt2 = t1.elapsed().as_secs_f64();
-
-                let mut survivor = None;
-                for (idx, &addr) in candidates.iter().enumerate() {
-                    let after = self.read_f64(addr).unwrap_or(f64::NAN);
-                    let bef = before[idx];
-                    if bef.is_finite() && after.is_finite() {
-                        let delta = after - bef;
-                        if delta > 0.0 && (delta - dt2).abs() < dt2 * 0.4 && after <= dur_max {
-                            survivor = Some(addr);
-                            break;
-                        }
+        while i + 4 <= limit {
+            for (fi, &fmt) in CLOCK_FORMATS.iter().enumerate() {
+                if let (Some(sa), Some(sb)) = (extract_seconds(&a, i, fmt), extract_seconds(&b, i, fmt))
+                {
+                    if advances(sa, sb, dt) {
+                        candidates.push((base + i, fmt));
+                        per_format[fi] += 1;
                     }
                 }
-                match survivor {
-                    Some(a) => crate::diag!("[clock] schedule found at 0x{a:X} (after round 2)"),
-                    None => crate::diag!("[clock] round 2 eliminated all candidates"),
-                }
-                survivor
+            }
+            i += 4;
+        }
+        for (fi, &fmt) in CLOCK_FORMATS.iter().enumerate() {
+            if per_format[fi] > 0 {
+                crate::diag!("[clock] round 1: {} candidate(s) as {fmt:?}", per_format[fi]);
             }
         }
+        crate::diag!("[clock] round 1: {} candidate(s) total (dt={dt:.2}s)", candidates.len());
+
+        if candidates.is_empty() {
+            return None;
+        }
+        if candidates.len() == 1 {
+            crate::diag!("[clock] schedule found at 0x{:X} as {:?}", candidates[0].0, candidates[0].1);
+            return Some(candidates[0]);
+        }
+
+        // Disambiguate with a second timed round.
+        let before: Vec<f64> = candidates
+            .iter()
+            .map(|&(addr, fmt)| self.read_clock_seconds(addr, fmt).unwrap_or(f64::NAN))
+            .collect();
+        let t1 = Instant::now();
+        sleep(Duration::from_millis(1200));
+        let dt2 = t1.elapsed().as_secs_f64();
+
+        let mut survivor = None;
+        for (idx, &(addr, fmt)) in candidates.iter().enumerate() {
+            let after = self.read_clock_seconds(addr, fmt).unwrap_or(f64::NAN);
+            let bef = before[idx];
+            if bef.is_finite() && after.is_finite() && advances(bef, after, dt2) {
+                survivor = Some((addr, fmt));
+                break;
+            }
+        }
+        match survivor {
+            Some((a, f)) => crate::diag!("[clock] schedule found at 0x{a:X} as {f:?} (after round 2)"),
+            None => crate::diag!("[clock] round 2 eliminated all {} candidates", candidates.len()),
+        }
+        survivor
     }
 
     /// Scan the `.text` section of the module based at `module_base` for an AOB

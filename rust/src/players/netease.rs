@@ -21,7 +21,7 @@ use serde::Deserialize;
 use super::MusicPlayer;
 use crate::diag;
 use crate::model::PlayerInfo;
-use crate::platform::memory::{module_base_size, read_std_string_x64, ProcessMemory};
+use crate::platform::memory::{module_base_size, read_std_string_x64, ClockFormat, ProcessMemory};
 use crate::platform::window::find_by_class;
 
 const NETEASE_CLASS: &str = "OrpheusBrowserHost";
@@ -67,8 +67,8 @@ pub struct NetEase {
     enrich_cache: RefCell<Option<(String, Enrichment)>>,
     /// title mode fallback: approximate progress from when the title changed.
     progress: RefCell<Option<TitleProgress>>,
-    /// title mode: auto-discovered playback-clock address, once found.
-    clock: RefCell<Option<usize>>,
+    /// title mode: auto-discovered playback-clock (address + numeric format), once found.
+    clock: RefCell<Option<(usize, ClockFormat)>>,
     /// title mode: failed discovery attempts (we stop trying after a few).
     clock_fails: RefCell<u32>,
     /// title mode: last (position, instant) for pause detection.
@@ -180,8 +180,8 @@ impl NetEase {
         // Prefer the real playback clock (accurate position + pause detection);
         // fall back to approximate title timing if it couldn't be found.
         let (schedule, paused) = match self.clock_address(duration) {
-            Some(addr) => {
-                let value = self.mem.read_f64(addr).unwrap_or(0.0).max(0.0);
+            Some((addr, fmt)) => {
+                let value = self.mem.read_clock_seconds(addr, fmt).unwrap_or(0.0).max(0.0);
                 let paused = self.detect_pause(value);
                 let sched = if duration > 0.0 { value.min(duration) } else { value };
                 (sched, paused)
@@ -213,18 +213,18 @@ impl NetEase {
     /// Return the auto-discovered playback-clock address, running discovery (a
     /// ~2.4s blocking scan) if needed. Retries a few times across reads before
     /// giving up and letting the caller fall back to approximate progress.
-    fn clock_address(&self, duration: f64) -> Option<usize> {
-        if let Some(addr) = *self.clock.borrow() {
-            return Some(addr);
+    fn clock_address(&self, duration: f64) -> Option<(usize, ClockFormat)> {
+        if let Some(found) = *self.clock.borrow() {
+            return Some(found);
         }
         if *self.clock_fails.borrow() >= CLOCK_MAX_ATTEMPTS {
             return None;
         }
 
         match self.mem.find_playback_clock(self.base, self.size, duration) {
-            Some(addr) => {
-                *self.clock.borrow_mut() = Some(addr);
-                Some(addr)
+            Some(found) => {
+                *self.clock.borrow_mut() = Some(found);
+                Some(found)
             }
             None => {
                 let mut fails = self.clock_fails.borrow_mut();
