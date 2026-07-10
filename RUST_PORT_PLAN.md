@@ -219,6 +219,15 @@ Both readers decode an MSVC `std::basic_string` with small-string optimisation:
 
 Provide one helper per bitness (`read_std_string_x64`, `read_std_string_x86`) and decode as UTF-8.
 
+### 6.3a NetEase metadata: local-first, API fallback
+Playback state (id/position/status) can only come from the desktop app's memory —
+no cloud API knows your live position. But track **metadata** (title/artist/album/
+cover) is fragile because it depends on the on-disk `playingList` JSON. So resolve
+metadata by song id with a fallback chain: **in-memory cache → local `playingList`
+JSON → NetEase web API** (`music.163.com/api/song/detail`). The cache keys on song
+id so the file read / network call happens once per song change, never per tick.
+(QQ Music reads all metadata from memory already, so it needs no such fallback.)
+
 ### 6.4 Window discovery
 `User32.GetWindowTitle(className, out title, out pid)` → `platform::window::find_by_class(name)`
 returning `Option<(String, u32)>` via `EnumWindows` + `GetClassNameW` + `GetWindowThreadProcessId`.
