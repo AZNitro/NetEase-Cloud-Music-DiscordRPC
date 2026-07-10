@@ -71,17 +71,9 @@ pub struct NetEase {
     enrich_cache: RefCell<Option<(String, Enrichment)>>,
     /// memory mode: cache full track metadata keyed by song id.
     meta_cache: RefCell<Option<(String, FullTrack)>>,
-    /// title mode: play-aware position (advances only while playing, resets per song).
+    /// title mode: play-aware position (advances while the title is shown).
     progress: RefCell<Option<TitleProgress>>,
-    /// title mode: throttled cache of the last audio play/pause check.
-    last_audio: RefCell<Option<(Instant, bool)>>,
 }
-
-/// NetEase's audio sessions belong to processes whose exe name contains this.
-const NETEASE_PROCESS: &str = "cloudmusic";
-
-/// Re-query the audio session at most this often (ms); reuse the cached result between.
-const AUDIO_POLL_MS: u128 = 400;
 
 impl NetEase {
     pub fn new(pid: u32) -> anyhow::Result<Self> {
@@ -103,8 +95,8 @@ impl NetEase {
             },
             _ => {
                 diag!(
-                    "[netease] 32-bit client: using window-title reader + audio-session play/pause \
-                     (the memory patterns are x64-only)"
+                    "[netease] 32-bit client: using window-title reader \
+                     (the memory patterns are x64-only; pause via WASAPI is unreliable on this client)"
                 );
                 Source::Title
             }
@@ -126,7 +118,6 @@ impl NetEase {
             enrich_cache: RefCell::new(None),
             meta_cache: RefCell::new(None),
             progress: RefCell::new(None),
-            last_audio: RefCell::new(None),
         })
     }
 
@@ -181,7 +172,7 @@ impl NetEase {
     // --- title mode (32-bit) ---
 
     fn read_from_title(&self) -> Option<PlayerInfo> {
-        let (title, _pid) = find_by_class(NETEASE_CLASS)?;
+        let (title, _window_pid) = find_by_class(NETEASE_CLASS)?;
         if title.trim().is_empty() {
             return None;
         }
@@ -194,11 +185,12 @@ impl NetEase {
         let enrich = self.enrich(&song, &artists);
         let duration = enrich.duration;
 
-        // Play/pause from whether NetEase is actually outputting audio; position
-        // accumulates from the song start and freezes while paused.
-        let playing = self.playing_now();
+        // Title mode always reports playing while the window shows a song.
+        // WASAPI peak/Active is unreliable on Chromium NetEase (peak≈0 / flaky
+        // Inactive) and was clearing Discord presence entirely.
+        let playing = true;
         let schedule = self.advance_progress(&title, playing, duration);
-        let paused = !playing;
+        let paused = false;
 
         let url = if enrich.id.is_empty() {
             "https://music.163.com/".to_string()
@@ -219,22 +211,8 @@ impl NetEase {
         })
     }
 
-    /// Whether NetEase is currently outputting audio (throttled so we don't query
-    /// WASAPI every tick). On any uncertainty, assume playing — never false-pause.
-    fn playing_now(&self) -> bool {
-        let now = Instant::now();
-        if let Some((when, value)) = *self.last_audio.borrow() {
-            if now.duration_since(when).as_millis() < AUDIO_POLL_MS {
-                return value;
-            }
-        }
-        let value = crate::platform::audio::any_active_session(NETEASE_PROCESS).unwrap_or(true);
-        *self.last_audio.borrow_mut() = Some((now, value));
-        value
-    }
-
-    /// Position for title mode: accumulates real time only while playing, resets
-    /// when `key` (the song) changes, and is capped at the track duration.
+    /// Position for title mode: accumulates real time while the title is shown,
+    /// resets when `key` (the song) changes, and is capped at the track duration.
     fn advance_progress(&self, key: &str, playing: bool, duration: f64) -> f64 {
         let now = Instant::now();
         let mut guard = self.progress.borrow_mut();

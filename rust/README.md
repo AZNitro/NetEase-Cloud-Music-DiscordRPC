@@ -25,8 +25,9 @@ The NetEase reader auto-selects a mode by client bitness:
   memory (AOB pattern scan), metadata from the local playlist / web API by song id
   (cached per song; falls back to an id-only presence if metadata is missing).
 - **32-bit client → title mode:** `Song - Artist` from the `OrpheusBrowserHost`
-  window title; cover/album/duration from playlist or web API search; play/pause
-  from the Windows audio session (WASAPI); position tracked while playing.
+  window title; cover/album/duration from playlist or web API search; position
+  tracked while the title is shown. (WASAPI play/pause was removed — it
+  false-paused on Chromium NetEase and cleared Discord.)
 
 ## Build & run (on Windows)
 
@@ -72,7 +73,7 @@ src/
 ├── rpc.rs             PlayerInfo -> Discord activity
 ├── updater.rs         233 ms poll loop (worker thread)
 ├── players/           netease.rs, MusicPlayer trait
-└── platform/          memory, window, audio, http, autostart, instance
+└── platform/          memory, window, http, autostart, instance
 assets/
 └── icon.ico           tray icon
 ```
