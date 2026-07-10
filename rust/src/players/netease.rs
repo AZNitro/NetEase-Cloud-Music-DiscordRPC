@@ -6,8 +6,13 @@
 //! * **Title mode** (32-bit client, or if the patterns don't resolve): reads
 //!   `Song - Artist` straight from the `OrpheusBrowserHost` window title — which
 //!   is version-independent — and enriches cover/album/duration from the local
-//!   playlist (matched by name) or the NetEase web API. Progress is approximated
-//!   from when the title last changed.
+//!   playlist (matched by name) or the NetEase web API. Play/pause comes from the
+//!   Windows audio session (is the app actually outputting sound?), and position
+//!   is tracked from the song's start, advancing only while playing.
+//!
+//! (An earlier title-mode build tried to memory-scan for the position clock, but
+//! this NetEase client is Chromium-based: the position isn't at a stable address
+//! and dozens of unrelated counters tick at 1/s, so that approach was unreliable.)
 //!
 //! The 64-bit patterns are x64 machine code and cannot match a 32-bit client, so
 //! title mode is what makes the 32-bit client work at all.
@@ -21,7 +26,7 @@ use serde::Deserialize;
 use super::MusicPlayer;
 use crate::diag;
 use crate::model::PlayerInfo;
-use crate::platform::memory::{module_base_size, read_std_string_x64, ClockFormat, ProcessMemory};
+use crate::platform::memory::{module_base_size, read_std_string_x64, ProcessMemory};
 use crate::platform::window::find_by_class;
 
 const NETEASE_CLASS: &str = "OrpheusBrowserHost";
@@ -35,15 +40,16 @@ const STATUS_PAUSED: i32 = 2;
 enum Source {
     /// Precise 64-bit reader: resolved AudioPlayer + Schedule pointers.
     Memory { audio_player: usize, schedule_ptr: usize },
-    /// 32-bit / fallback: song from window title, position from an auto-found clock.
+    /// 32-bit / fallback: song from window title, play/pause from the audio session.
     Title,
 }
 
-/// Tracks when the current window title first appeared, to approximate playback
-/// position in title mode.
+/// Play-aware position for title mode: accumulates only while playing, and resets
+/// when the song (key) changes.
 struct TitleProgress {
-    title: String,
-    started: Instant,
+    key: String,
+    elapsed: f64,
+    last: Instant,
 }
 
 /// Extra metadata resolved for a title-mode song (title/artist come from the
@@ -63,19 +69,17 @@ pub struct NetEase {
     playlist_path: PathBuf,
     /// title mode: cache enrichment keyed by song name (avoids re-hitting disk/API).
     enrich_cache: RefCell<Option<(String, Enrichment)>>,
-    /// title mode fallback: approximate progress from when the title changed.
+    /// title mode: play-aware position (advances only while playing, resets per song).
     progress: RefCell<Option<TitleProgress>>,
-    /// title mode: auto-discovered playback-clock (address + numeric format), once found.
-    clock: RefCell<Option<(usize, ClockFormat)>>,
-    /// title mode: failed discovery attempts (we stop trying after a few).
-    clock_fails: RefCell<u32>,
-    /// title mode: last (position, instant) for pause detection.
-    pause_tracker: RefCell<Option<(f64, Instant)>>,
+    /// title mode: throttled cache of the last audio play/pause check.
+    last_audio: RefCell<Option<(Instant, bool)>>,
 }
 
-/// How many times to attempt playback-clock discovery before giving up and
-/// using approximate progress (each attempt blocks ~2.4s while scanning).
-const CLOCK_MAX_ATTEMPTS: u32 = 3;
+/// NetEase's audio sessions belong to processes whose exe name contains this.
+const NETEASE_PROCESS: &str = "cloudmusic";
+
+/// Re-query the audio session at most this often (ms); reuse the cached result between.
+const AUDIO_POLL_MS: u128 = 400;
 
 impl NetEase {
     pub fn new(pid: u32) -> anyhow::Result<Self> {
@@ -97,7 +101,7 @@ impl NetEase {
             },
             _ => {
                 diag!(
-                    "[netease] 32-bit client: using window-title reader + memory-scanned clock \
+                    "[netease] 32-bit client: using window-title reader + audio-session play/pause \
                      (the memory patterns are x64-only)"
                 );
                 Source::Title
@@ -119,9 +123,7 @@ impl NetEase {
             playlist_path,
             enrich_cache: RefCell::new(None),
             progress: RefCell::new(None),
-            clock: RefCell::new(None),
-            clock_fails: RefCell::new(0),
-            pause_tracker: RefCell::new(None),
+            last_audio: RefCell::new(None),
         })
     }
 
@@ -173,17 +175,11 @@ impl NetEase {
         let enrich = self.enrich(&song, &artists);
         let duration = enrich.duration;
 
-        // Prefer the real playback clock (accurate position + pause detection);
-        // fall back to approximate title timing if it couldn't be found.
-        let (schedule, paused) = match self.clock_address(duration) {
-            Some((addr, fmt)) => {
-                let value = self.mem.read_clock_seconds(addr, fmt).unwrap_or(0.0).max(0.0);
-                let paused = self.detect_pause(value);
-                let sched = if duration > 0.0 { value.min(duration) } else { value };
-                (sched, paused)
-            }
-            None => (self.approx_elapsed(&title, duration), false),
-        };
+        // Play/pause from whether NetEase is actually outputting audio; position
+        // accumulates from the song start and freezes while paused.
+        let playing = self.playing_now();
+        let schedule = self.advance_progress(&title, playing, duration);
+        let paused = !playing;
 
         let url = if enrich.id.is_empty() {
             "https://music.163.com/".to_string()
@@ -206,62 +202,35 @@ impl NetEase {
         Some(info)
     }
 
-    /// Return the auto-discovered playback-clock address, running discovery (a
-    /// ~2.4s blocking scan) if needed. Retries a few times across reads before
-    /// giving up and letting the caller fall back to approximate progress.
-    fn clock_address(&self, duration: f64) -> Option<(usize, ClockFormat)> {
-        if let Some(found) = *self.clock.borrow() {
-            return Some(found);
-        }
-        if *self.clock_fails.borrow() >= CLOCK_MAX_ATTEMPTS {
-            return None;
-        }
-
-        match self.mem.find_playback_clock(duration) {
-            Some(found) => {
-                *self.clock.borrow_mut() = Some(found);
-                Some(found)
-            }
-            None => {
-                let mut fails = self.clock_fails.borrow_mut();
-                *fails += 1;
-                diag!(
-                    "[netease] clock not found (attempt {}/{}); \
-                     is a song actually playing? using approximate position for now",
-                    *fails,
-                    CLOCK_MAX_ATTEMPTS
-                );
-                None
-            }
-        }
-    }
-
-    /// Pause detection for title mode: the clock value not advancing between
-    /// reads (while wall-clock time passed) means playback is paused.
-    fn detect_pause(&self, value: f64) -> bool {
+    /// Whether NetEase is currently outputting audio (throttled so we don't query
+    /// WASAPI every tick). On any uncertainty, assume playing — never false-pause.
+    fn playing_now(&self) -> bool {
         let now = Instant::now();
-        let mut guard = self.pause_tracker.borrow_mut();
-        let paused = match *guard {
-            Some((last_value, last_time)) => {
-                let dt = now.duration_since(last_time).as_secs_f64();
-                dt > 0.15 && (value - last_value) < 0.03
+        if let Some((when, value)) = *self.last_audio.borrow() {
+            if now.duration_since(when).as_millis() < AUDIO_POLL_MS {
+                return value;
             }
-            None => false,
-        };
-        *guard = Some((value, now));
-        paused
+        }
+        let value = crate::platform::audio::any_active_session(NETEASE_PROCESS).unwrap_or(true);
+        *self.last_audio.borrow_mut() = Some((now, value));
+        value
     }
 
-    /// Fallback progress: seconds since the window title last changed.
-    fn approx_elapsed(&self, title: &str, duration: f64) -> f64 {
+    /// Position for title mode: accumulates real time only while playing, resets
+    /// when `key` (the song) changes, and is capped at the track duration.
+    fn advance_progress(&self, key: &str, playing: bool, duration: f64) -> f64 {
+        let now = Instant::now();
         let mut guard = self.progress.borrow_mut();
-        let elapsed = match guard.as_ref() {
-            Some(p) if p.title == title => p.started.elapsed().as_secs_f64(),
-            _ => {
-                *guard = Some(TitleProgress { title: title.to_string(), started: Instant::now() });
-                0.0
+        match guard.as_mut() {
+            Some(p) if p.key == key => {
+                if playing {
+                    p.elapsed += now.duration_since(p.last).as_secs_f64();
+                }
+                p.last = now;
             }
-        };
+            _ => *guard = Some(TitleProgress { key: key.to_string(), elapsed: 0.0, last: now }),
+        }
+        let elapsed = guard.as_ref().map(|p| p.elapsed).unwrap_or(0.0);
         if duration > 0.0 {
             elapsed.min(duration)
         } else {

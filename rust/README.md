@@ -23,10 +23,11 @@ The NetEase reader auto-selects a mode by client bitness:
 - **32-bit client → title mode:** `Song - Artist` is read straight from the
   `OrpheusBrowserHost` window title (version-independent). Cover/album/duration are
   filled in from the local playlist (matched by name) or the NetEase web API search.
-  Real position **and pause** come from the playback clock, which is
-  **auto-discovered** (no version-specific offsets): a one-time ~2.4s scan finds the
-  `double` in memory that ticks up like a play position. If discovery fails (e.g.
-  nothing playing during the scan), it falls back to approximate title timing.
+  **Play/pause** comes from the Windows audio session (WASAPI) — whether NetEase is
+  actually outputting sound — and **position** is tracked from the song's start,
+  advancing only while playing and resetting on each track change. (This client is
+  Chromium-based, so the position isn't at a stable memory address; audio-session
+  state is the reliable signal. Trade-off: seeking within a track isn't reflected.)
 
 The web API path uses plain HTTP and is best-effort — if it fails, the presence
 still shows song + artist.
