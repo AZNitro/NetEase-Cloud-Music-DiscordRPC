@@ -2,7 +2,7 @@
 name = "music-rpc"
 version = "3.0.0"
 edition = "2021"
-description = "Discord Rich Presence for NetEase Cloud Music and Tencent QQ Music (Rust port)"
+description = "Discord Rich Presence for NetEase Cloud Music (Rust port)"
 
 [[bin]]
 name = "MusicRpc"

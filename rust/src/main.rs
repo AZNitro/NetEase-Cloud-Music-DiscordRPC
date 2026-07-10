@@ -9,6 +9,6 @@ fn main() -> anyhow::Result<()> {
 fn main() {
     eprintln!(
         "MusicRpc only runs on Windows — it works by reading the memory of the \
-         Windows builds of NetEase Cloud Music / QQ Music."
+         Windows build of NetEase Cloud Music."
     );
 }

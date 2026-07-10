@@ -1,4 +1,4 @@
-//! Discord Rich Presence for NetEase Cloud Music and Tencent QQ Music.
+//! Discord Rich Presence for NetEase Cloud Music.
 //!
 //! Platform-agnostic modules (`logging`, `model`, `pattern`, `loop_logic`) compile
 //! everywhere so their logic can be unit-tested on any host. Everything that

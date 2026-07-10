@@ -1,28 +1,9 @@
-//! Pure poll-loop helpers (no Win32) so clear/switch behaviour is unit-testable
+//! Pure poll-loop helpers (no Win32) so clear/retry behaviour is unit-testable
 //! on any host.
 
-/// Which music client currently owns the Discord presence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlayerKind {
-    NetEase,
-    Tencent,
-}
-
-/// When the detected player changes, which previously-published presence (if any)
-/// must be cleared before continuing.
-///
-/// - Player window gone → clear the last active kind.
-/// - Switched NetEase ↔ Tencent → clear the previous kind (two Discord app IDs).
-/// - Same kind / nothing published yet → clear nothing.
-pub fn presence_to_clear(
-    last_rpc: Option<PlayerKind>,
-    detected: Option<PlayerKind>,
-) -> Option<PlayerKind> {
-    match (last_rpc, detected) {
-        (Some(prev), None) => Some(prev),
-        (Some(prev), Some(cur)) if prev != cur => Some(prev),
-        _ => None,
-    }
+/// When the NetEase window disappears, clear any previously published presence.
+pub fn should_clear_presence(had_presence: bool, player_detected: bool) -> bool {
+    had_presence && !player_detected
 }
 
 /// Whether a failed reader attach should be retried now.
@@ -39,32 +20,14 @@ mod tests {
 
     #[test]
     fn clears_when_player_gone() {
-        assert_eq!(
-            presence_to_clear(Some(PlayerKind::NetEase), None),
-            Some(PlayerKind::NetEase)
-        );
+        assert!(should_clear_presence(true, false));
     }
 
     #[test]
-    fn clears_previous_when_switching_apps() {
-        assert_eq!(
-            presence_to_clear(Some(PlayerKind::NetEase), Some(PlayerKind::Tencent)),
-            Some(PlayerKind::NetEase)
-        );
-        assert_eq!(
-            presence_to_clear(Some(PlayerKind::Tencent), Some(PlayerKind::NetEase)),
-            Some(PlayerKind::Tencent)
-        );
-    }
-
-    #[test]
-    fn no_clear_when_same_or_idle() {
-        assert_eq!(
-            presence_to_clear(Some(PlayerKind::NetEase), Some(PlayerKind::NetEase)),
-            None
-        );
-        assert_eq!(presence_to_clear(None, Some(PlayerKind::Tencent)), None);
-        assert_eq!(presence_to_clear(None, None), None);
+    fn no_clear_while_detected_or_idle() {
+        assert!(!should_clear_presence(true, true));
+        assert!(!should_clear_presence(false, false));
+        assert!(!should_clear_presence(false, true));
     }
 
     #[test]

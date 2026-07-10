@@ -71,9 +71,6 @@ impl ProcessMemory {
     pub fn read_i32(&self, addr: usize) -> io::Result<i32> {
         Ok(i32::from_le_bytes(self.read_arr::<4>(addr)?))
     }
-    pub fn read_u32(&self, addr: usize) -> io::Result<u32> {
-        Ok(u32::from_le_bytes(self.read_arr::<4>(addr)?))
-    }
     pub fn read_i64(&self, addr: usize) -> io::Result<i64> {
         Ok(i64::from_le_bytes(self.read_arr::<8>(addr)?))
     }
@@ -164,22 +161,6 @@ pub fn read_std_string_x64(mem: &ProcessMemory, base: usize) -> Option<String> {
         mem.read_bytes(base, len).ok()?
     } else {
         let ptr = mem.read_i64(base).ok()? as usize;
-        mem.read_bytes(ptr, len).ok()?
-    };
-    Some(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-/// Read a remote MSVC `std::string` from a **32-bit** process (QQ Music).
-pub fn read_std_string_x86(mem: &ProcessMemory, base: usize) -> Option<String> {
-    let len = mem.read_i32(base + 0x10).ok()?;
-    if len <= 0 {
-        return Some(String::new());
-    }
-    let len = len as usize;
-    let bytes = if len <= 15 {
-        mem.read_bytes(base, len).ok()?
-    } else {
-        let ptr = mem.read_u32(base).ok()? as usize;
         mem.read_bytes(ptr, len).ok()?
     };
     Some(String::from_utf8_lossy(&bytes).into_owned())

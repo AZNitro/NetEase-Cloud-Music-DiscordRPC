@@ -12,7 +12,7 @@ const GITHUB_URL: &str = "https://github.com/Kxnrl/NetEase-Cloud-Music-DiscordRP
 pub struct Rpc {
     client: DiscordIpcClient,
     app_id: String,
-    /// Shown as the Discord small-image tooltip (e.g. "NetEase CloudMusic" / "QQ Music").
+    /// Shown as the Discord small-image tooltip (e.g. "NetEase CloudMusic").
     brand: String,
     connected: bool,
 }

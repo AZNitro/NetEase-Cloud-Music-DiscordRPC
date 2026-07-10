@@ -1,7 +1,6 @@
 use crate::model::PlayerInfo;
 
 pub mod netease;
-pub mod tencent;
 
 /// A source of "what's playing right now", bound to a specific process.
 pub trait MusicPlayer {
