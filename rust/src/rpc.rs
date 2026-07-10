@@ -12,14 +12,21 @@ const GITHUB_URL: &str = "https://github.com/Kxnrl/NetEase-Cloud-Music-DiscordRP
 pub struct Rpc {
     client: DiscordIpcClient,
     app_id: String,
+    /// Shown as the Discord small-image tooltip (e.g. "NetEase CloudMusic" / "QQ Music").
+    brand: String,
     connected: bool,
 }
 
 impl Rpc {
-    pub fn new(app_id: &str) -> anyhow::Result<Self> {
+    pub fn new(app_id: &str, brand: &str) -> anyhow::Result<Self> {
         let client = DiscordIpcClient::new(app_id)
             .map_err(|e| anyhow::anyhow!("failed to create RPC client {app_id}: {e}"))?;
-        Ok(Self { client, app_id: app_id.to_string(), connected: false })
+        Ok(Self {
+            client,
+            app_id: app_id.to_string(),
+            brand: brand.to_string(),
+            connected: false,
+        })
     }
 
     /// Connect if not already connected. Returns whether we're connected.
@@ -75,10 +82,17 @@ impl Rpc {
         let mut assets = Assets::new()
             .large_image(large_image)
             .small_image("timg")
-            .small_text("NetEase CloudMusic");
+            .small_text(&self.brand);
         if !info.album.is_empty() {
             assets = assets.large_text(&album);
         }
+
+        // Discord rejects empty button URLs; skip the Listen button if we have none.
+        let mut buttons = Vec::with_capacity(2);
+        if !info.url.is_empty() {
+            buttons.push(Button::new("🎧 Listen", &info.url));
+        }
+        buttons.push(Button::new("👏 View App on GitHub", GITHUB_URL));
 
         let activity = Activity::new()
             .activity_type(ActivityType::Listening)
@@ -86,10 +100,7 @@ impl Rpc {
             .state(&state)
             .timestamps(timestamps)
             .assets(assets)
-            .buttons(vec![
-                Button::new("🎧 Listen", &info.url),
-                Button::new("👏 View App on GitHub", GITHUB_URL),
-            ]);
+            .buttons(buttons);
 
         if let Err(e) = self.client.set_activity(activity) {
             diag!("[rpc] set_activity failed ({}): {e}", self.app_id);

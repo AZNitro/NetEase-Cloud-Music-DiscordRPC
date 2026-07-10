@@ -13,18 +13,22 @@ discord-rich-presence = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
-# Minimal blocking HTTP client for the NetEase metadata API fallback.
-# default-features = false keeps it to plain HTTP (no TLS / no C toolchain), so
-# the whole crate still cross-compiles for Windows from any host.
-minreq = { version = "2", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
 
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.59"
 features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Networking_WinHttp",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
     "Win32_System_Threading",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ]
 
@@ -37,6 +41,7 @@ features = [
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
     "Win32_System_Com",
+    "Win32_UI_WindowsAndMessaging",
 ]
 
 [profile.release]

@@ -8,13 +8,13 @@ on:
 
 jobs:
 
-  build:
+  build-dotnet:
 
     strategy:
       matrix:
         configuration: [Release]
 
-    runs-on: windows-latest 
+    runs-on: windows-latest
 
     steps:
     - name: Checkout
@@ -36,3 +36,30 @@ jobs:
 
     - name: Build
       run: dotnet build --no-restore
+
+  build-rust:
+
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Test (platform-agnostic)
+      working-directory: rust
+      run: cargo test
+
+    - name: Build release
+      working-directory: rust
+      run: cargo build --release
+
+    - name: Upload MusicRpc.exe
+      uses: actions/upload-artifact@v4
+      with:
+        name: MusicRpc-windows
+        path: rust/target/release/MusicRpc.exe

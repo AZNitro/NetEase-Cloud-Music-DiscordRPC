@@ -6,9 +6,6 @@
 //! Everything returns `None` on any failure, so a transient COM error is treated
 //! as "unknown" (the caller assumes playing) and never looks like a false pause.
 
-use std::thread::sleep;
-use std::time::Duration;
-
 use windows::core::Interface;
 use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
 use windows::Win32::Media::Audio::{
@@ -99,12 +96,6 @@ fn query(name_substr: &str) -> windows::core::Result<Option<bool>> {
                 None => active, // no meter available; fall back to session state
             };
             producing_sound |= playing;
-            diag!(
-                "[audio] pid={pid} '{name}' state={} peak={} -> {}",
-                if active { "Active" } else { "Inactive" },
-                peak.map(|p| format!("{p:.4}")).unwrap_or_else(|| "n/a".into()),
-                if playing { "playing" } else { "paused" }
-            );
         }
 
         if !matched {
@@ -115,19 +106,10 @@ fn query(name_substr: &str) -> windows::core::Result<Option<bool>> {
     }
 }
 
-/// Read the session peak a few times over ~45ms and return the max, so a brief
-/// zero-crossing during playback isn't mistaken for silence.
+/// Single peak sample — no sleeps. Callers already throttle WASAPI queries
+/// (~400 ms), and a rolling "last known playing" cache absorbs brief zeros.
 unsafe fn sample_peak(meter: &IAudioMeterInformation) -> Option<f64> {
-    let mut max = 0.0f32;
-    let mut ok = false;
-    for _ in 0..3 {
-        if let Ok(p) = meter.GetPeakValue() {
-            max = max.max(p);
-            ok = true;
-        }
-        sleep(Duration::from_millis(15));
-    }
-    ok.then_some(max as f64)
+    meter.GetPeakValue().ok().map(|p| p as f64)
 }
 
 /// The executable file name (e.g. `cloudmusic.exe`) of a process, lowercased by

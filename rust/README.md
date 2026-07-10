@@ -3,38 +3,31 @@
 A Rust rewrite of the C# app in this repo. See [`../RUST_PORT_PLAN.md`](../RUST_PORT_PLAN.md)
 for the full design.
 
-> **Status: testable console MVP.** The hard 80% is done — window detection,
-> cross-process memory reading, pattern scanning, the NetEase/QQ Music readers,
-> Discord Rich Presence, and the poll loop. It runs as a **console app with heavy
-> diagnostic logging** so the first round of real-world testing is easy. The tray
-> icon, auto-start, and single-instance guard are intentionally deferred until the
-> memory reads are confirmed on a live machine.
+> **Status: tray app with behavioural fixes.** Window detection, memory reading,
+> pattern scanning, NetEase/QQ Music readers, Discord Rich Presence, tray icon,
+> auto-start, and single-instance guard are in place. Diagnostics go to
+> `music-rpc.log` next to the executable (the process is a Windows subsystem
+> app, so there is no console window).
 
-## What already works (and is verified)
+## What works
 
-- Cross-compiles cleanly for Windows (`cargo check --target x86_64-pc-windows-gnu`).
-- Unit tests for the AOB pattern scanner pass (`cargo test`).
-- No clippy warnings.
+- Cross-compiles / type-checks for Windows (`cargo check --target x86_64-pc-windows-gnu`).
+- Unit tests for the AOB pattern scanner and poll-loop clear/switch helpers.
+- Tray icon with **AutoStart** toggle and **Exit**.
+- Single-instance mutex (`MusicDiscordRpc`).
+- First-run auto-start (fixed: config *absent* ⇒ first run).
+- Presence cleared when the player window disappears or when switching apps.
+- Failed reader attaches retry with backoff (startup DLL race).
+- NetEase web API over HTTPS (WinHTTP / Schannel).
 
 The NetEase reader auto-selects a mode by client bitness:
 
 - **64-bit client → memory mode:** precise position/status from `cloudmusic.dll`
-  memory (AOB pattern scan), metadata from the local playlist / web API by song id.
-- **32-bit client → title mode:** `Song - Artist` is read straight from the
-  `OrpheusBrowserHost` window title (version-independent). Cover/album/duration are
-  filled in from the local playlist (matched by name) or the NetEase web API search.
-  **Play/pause** comes from the Windows audio session (WASAPI) — whether NetEase is
-  actually outputting sound — and **position** is tracked from the song's start,
-  advancing only while playing and resetting on each track change. (This client is
-  Chromium-based, so the position isn't at a stable memory address; audio-session
-  state is the reliable signal. Trade-off: seeking within a track isn't reflected.)
-
-The web API path uses plain HTTP and is best-effort — if it fails, the presence
-still shows song + artist.
-
-The one thing that **cannot** be verified without a Windows machine running the music
-apps + Discord is whether the memory offsets/patterns read correctly on your build.
-That's what the diagnostic log is for.
+  memory (AOB pattern scan), metadata from the local playlist / web API by song id
+  (cached per song; falls back to an id-only presence if metadata is missing).
+- **32-bit client → title mode:** `Song - Artist` from the `OrpheusBrowserHost`
+  window title; cover/album/duration from playlist or web API search; play/pause
+  from the Windows audio session (WASAPI); position tracked while playing.
 
 ## Build & run (on Windows)
 
@@ -45,49 +38,20 @@ cd rust
 cargo run --release
 ```
 
-Leave it running in the terminal with **Discord open** and **NetEase Cloud Music**
-or **QQ Music** playing a song. You'll see live diagnostics, and the same lines are
-written to `music-rpc.log` next to the executable
-(`rust/target/release/music-rpc.log`).
-
-## What a healthy log looks like
-
-```
-[..] MusicRpc starting (console diagnostic build)
-[..] [rpc] connected 481562643958595594
-[..] [loop] detected NetEase player window
-[..] [netease] cloudmusic.dll base=0x7FF... size=0x... pid=1234
-[..] [netease] AudioPlayer match=0x... disp=... ptr=0x...
-[..] [netease] Schedule match=0x... disp=... ptr=0x...
-[..] [netease] status=1
-[..] [netease] current song id = "123456"
-[..] [netease] metadata source: local playlist (123456)
-[..] [netease] PlayerInfo { title: "...", artists: "...", ... }
-```
-
-If the local playlist doesn't have the song you'll instead see the API fallback:
-
-```
-[..] [netease] local playlist has no id 123456; falling back to web API
-[..] [netease] web API GET http://music.163.com/api/song/detail/?id=123456&ids=%5B123456%5D
-```
-
-If the API call fails (`web API request failed` / `parse error`), it likely needs
-HTTPS — enabling minreq's `https` feature is the fix.
+With **Discord** open and **NetEase Cloud Music** or **QQ Music** playing, the
+tray icon appears and Rich Presence updates. Diagnostics are appended to
+`music-rpc.log` next to the executable (`rust/target/release/music-rpc.log`
+when running from cargo).
 
 ## If something's wrong
 
-Send me `music-rpc.log` (or the terminal output). The failure will be one specific
-line, e.g.:
+Send `music-rpc.log`. Typical lines:
 
 - `AudioPlayer pattern not found` / `CurrentSongInfo pattern not found`
   → the app updated and the AOB signature needs refreshing.
-- `[netease] current song id = ""` or a garbled string
-  → an offset drifted in this build.
+- `[loop] failed to init ...; retrying soon` → DLL not ready yet (will retry).
 - `[rpc] connect failed` → Discord isn't running / IPC pipe unavailable.
 - `no player window found (waiting)` forever → window class name changed.
-
-Each of these points at exactly one constant to update, so the fix is usually small.
 
 ## Tests
 
@@ -100,20 +64,18 @@ cargo check --target x86_64-pc-windows-gnu   # type-check the Windows code from 
 
 ```
 src/
-├── main.rs            entry point (console for now)
-├── lib.rs             module wiring; platform-agnostic vs #[cfg(windows)]
-├── logging.rs         dual stderr + file diagnostic logger
+├── main.rs            entry (windows subsystem)
+├── lib.rs             module wiring
+├── app.rs             tray, single-instance, first-run auto-start
+├── config.rs          first-run config file (fixed polarity)
+├── logging.rs         file diagnostic logger
+├── loop_logic.rs      clear/switch helpers (unit-tested)
 ├── model.rs           PlayerInfo
 ├── pattern.rs         AOB signature parse + scan (unit-tested)
 ├── rpc.rs             PlayerInfo -> Discord activity
-├── updater.rs         the 233 ms poll loop
+├── updater.rs         233 ms poll loop (worker thread)
 ├── players/           netease.rs, tencent.rs, MusicPlayer trait
-└── platform/          memory.rs (read + PE scan), window.rs (find by class)
+└── platform/          memory, window, audio, autostart, instance
+assets/
+└── icon.ico           tray icon
 ```
-
-## Remaining work (Phase 4+)
-
-- Tray icon + menu (`AutoStart` toggle, `Exit`) and `#![windows_subsystem = "windows"]`.
-- Auto-start registry entry (`HKCU\...\Run`).
-- Single-instance mutex.
-- GitHub Actions workflow: `cargo build --release` on `windows-latest`.

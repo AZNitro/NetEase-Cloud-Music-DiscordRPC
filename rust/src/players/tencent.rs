@@ -67,7 +67,7 @@ impl Tencent {
         let schedule_ms = self.mem.read_i32(self.base + STD * 4 + 12).ok()?;
         let status = self.mem.read_i32(self.base + STD * 4 + 16).ok()?;
 
-        let info = PlayerInfo {
+        Some(PlayerInfo {
             identity: id.to_string(),
             title: read_std_string_x86(&self.mem, self.base).unwrap_or_default(),
             artists: read_std_string_x86(&self.mem, self.base + STD).unwrap_or_default(),
@@ -77,9 +77,7 @@ impl Tencent {
             duration: duration_ms as f64 * 0.001,
             paused: status == 0,
             url: format!("https://y.qq.com/n/ryqq/songDetail/{id}"),
-        };
-        diag!("[tencent] {info:?}");
-        Some(info)
+        })
     }
 }
 

@@ -1,12 +1,15 @@
-//! The poll loop. Port of `Program.UpdateThread`, with the fixes noted in
-//! `RUST_PORT_PLAN.md` plus: it remembers failed readers so a broken player
-//! doesn't re-init (and re-log) every tick, and it logs the detected window
-//! title so we can see what metadata the window itself exposes.
+//! The poll loop. Port of `Program.UpdateThread`, with the fixes from analysis:
+//! clear presence when the player window disappears, clear the other Discord
+//! client when switching apps, and retry failed reader attaches with backoff.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
+use std::sync::Arc;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::diag;
+use crate::loop_logic::{self, PlayerKind};
 use crate::platform::window::find_by_class;
 use crate::players::{netease::NetEase, tencent::Tencent, MusicPlayer};
 use crate::rpc::Rpc;
@@ -19,36 +22,56 @@ const TENCENT_CLASS: &str = "QQMusic_Daemon_Wnd";
 
 const POLL: Duration = Duration::from_millis(233);
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Kind {
-    NetEase,
-    Tencent,
+/// Commands from the tray / UI thread.
+pub enum Command {
+    Exit,
 }
 
-/// Cached per-(kind,pid) reader state. `Failed` is remembered so we don't retry
-/// (and spam the log) every tick for a player we already couldn't attach to.
+/// Cached per-(kind,pid) reader state. Failed attaches are retried after backoff
+/// so a startup race (window up before the DLL is loaded) can recover.
 enum Cached {
     Reader(Box<dyn MusicPlayer>),
-    Failed,
+    Failed { next_retry: Instant },
 }
 
-pub fn run() -> anyhow::Result<()> {
-    crate::logging::init();
-    diag!("MusicRpc starting (console diagnostic build)");
+/// Run until `running` is false or an [`Command::Exit`] arrives.
+pub fn run_loop(running: Arc<AtomicBool>, commands: Receiver<Command>) -> anyhow::Result<()> {
+    diag!("MusicRpc poll loop starting");
 
-    let mut netease_rpc = Rpc::new(NETEASE_APP_ID)?;
-    let mut tencent_rpc = Rpc::new(TENCENT_APP_ID)?;
+    let mut netease_rpc = Rpc::new(NETEASE_APP_ID, "NetEase CloudMusic")?;
+    let mut tencent_rpc = Rpc::new(TENCENT_APP_ID, "QQ Music")?;
     netease_rpc.ensure_connected();
     tencent_rpc.ensure_connected();
 
-    let mut cached: Option<(Kind, u32, Cached)> = None;
-    let mut last_rpc: Option<Kind> = None;
-    let mut last_detect: Option<(Kind, u32, String)> = None;
+    let mut cached: Option<(PlayerKind, u32, Cached)> = None;
+    let mut last_rpc: Option<PlayerKind> = None;
+    let mut last_detect: Option<(PlayerKind, u32, String)> = None;
+    // Log track changes only: (kind, identity, paused).
+    let mut last_track_key: Option<(PlayerKind, String, bool)> = None;
 
-    loop {
+    while running.load(Ordering::SeqCst) {
+        // Exit is the only command today; drain one and shut down.
+        if commands.try_recv().is_ok() {
+            running.store(false, Ordering::SeqCst);
+            clear_last(&mut last_rpc, &mut netease_rpc, &mut tencent_rpc);
+            diag!("[loop] exit requested");
+            return Ok(());
+        }
+
         let target = detect();
+        let detected_kind = target.as_ref().map(|(k, _, _)| *k);
 
-        // Log detection changes only (kind / pid / title), so the log stays readable.
+        // Clear stale presence when the player disappears or we switch apps.
+        if let Some(prev) = loop_logic::presence_to_clear(last_rpc, detected_kind) {
+            diag!("[loop] clearing {prev:?} presence (detect={detected_kind:?})");
+            rpc_for(prev, &mut netease_rpc, &mut tencent_rpc).clear();
+            if last_rpc == Some(prev) {
+                last_rpc = None;
+            }
+            last_track_key = None;
+        }
+
+        // Log detection changes only (kind / pid / title).
         if last_detect != target {
             match &target {
                 Some((k, pid, title)) => {
@@ -65,21 +88,34 @@ pub fn run() -> anyhow::Result<()> {
             continue;
         };
 
-        // (Re)build the reader only when the (kind, pid) is new.
-        let fresh = !matches!(&cached, Some((k, p, _)) if *k == kind && *p == pid);
-        if fresh {
+        let now = Instant::now();
+        let rebuild = match &cached {
+            Some((k, p, Cached::Reader(_))) if *k == kind && *p == pid => false,
+            Some((k, p, Cached::Failed { next_retry })) if *k == kind && *p == pid => {
+                now >= *next_retry
+            }
+            _ => true,
+        };
+
+        if rebuild {
             match build_reader(kind, pid) {
                 Ok(r) => cached = Some((kind, pid, Cached::Reader(r))),
                 Err(e) => {
-                    diag!("[loop] failed to init {kind:?} (pid {pid}): {e:#}");
-                    cached = Some((kind, pid, Cached::Failed));
+                    diag!("[loop] failed to init {kind:?} (pid {pid}): {e:#}; retrying soon");
+                    cached = Some((
+                        kind,
+                        pid,
+                        Cached::Failed {
+                            next_retry: now
+                                + Duration::from_millis(loop_logic::ATTACH_RETRY_MS as u64),
+                        },
+                    ));
                 }
             }
         }
 
         let reader = match &cached {
             Some((_, _, Cached::Reader(r))) => r,
-            // Failed (or somehow empty): stay quiet until the window/pid changes.
             _ => {
                 sleep(POLL);
                 continue;
@@ -92,8 +128,21 @@ pub fn run() -> anyhow::Result<()> {
                     diag!("[loop] no track info; clearing {k:?} presence");
                     rpc_for(k, &mut netease_rpc, &mut tencent_rpc).clear();
                 }
+                last_track_key = None;
             }
             Some(info) => {
+                let key = (kind, info.identity.clone(), info.paused);
+                if last_track_key.as_ref() != Some(&key) {
+                    diag!(
+                        "[loop] track {:?} id={} paused={} title={:?}",
+                        kind,
+                        info.identity,
+                        info.paused,
+                        info.title
+                    );
+                    last_track_key = Some(key);
+                }
+
                 let rpc = rpc_for(kind, &mut netease_rpc, &mut tencent_rpc);
                 if info.paused {
                     rpc.clear();
@@ -106,28 +155,44 @@ pub fn run() -> anyhow::Result<()> {
 
         sleep(POLL);
     }
+
+    clear_last(&mut last_rpc, &mut netease_rpc, &mut tencent_rpc);
+    Ok(())
 }
 
-fn detect() -> Option<(Kind, u32, String)> {
+fn clear_last(last_rpc: &mut Option<PlayerKind>, netease: &mut Rpc, tencent: &mut Rpc) {
+    if let Some(k) = last_rpc.take() {
+        rpc_for(k, netease, tencent).clear();
+    }
+}
+
+fn detect() -> Option<(PlayerKind, u32, String)> {
     if let Some((title, pid)) = find_by_class(NETEASE_CLASS) {
-        Some((Kind::NetEase, pid, title))
+        Some((PlayerKind::NetEase, pid, title))
     } else if let Some((title, pid)) = find_by_class(TENCENT_CLASS) {
-        Some((Kind::Tencent, pid, title))
+        Some((PlayerKind::Tencent, pid, title))
     } else {
         None
     }
 }
 
-fn build_reader(kind: Kind, pid: u32) -> anyhow::Result<Box<dyn MusicPlayer>> {
+fn build_reader(kind: PlayerKind, pid: u32) -> anyhow::Result<Box<dyn MusicPlayer>> {
     match kind {
-        Kind::NetEase => Ok(Box::new(NetEase::new(pid)?)),
-        Kind::Tencent => Ok(Box::new(Tencent::new(pid)?)),
+        PlayerKind::NetEase => Ok(Box::new(NetEase::new(pid)?)),
+        PlayerKind::Tencent => Ok(Box::new(Tencent::new(pid)?)),
     }
 }
 
-fn rpc_for<'a>(kind: Kind, netease: &'a mut Rpc, tencent: &'a mut Rpc) -> &'a mut Rpc {
+fn rpc_for<'a>(kind: PlayerKind, netease: &'a mut Rpc, tencent: &'a mut Rpc) -> &'a mut Rpc {
     match kind {
-        Kind::NetEase => netease,
-        Kind::Tencent => tencent,
+        PlayerKind::NetEase => netease,
+        PlayerKind::Tencent => tencent,
     }
+}
+
+/// Headless entry (no tray): run until the process is killed.
+pub fn run() -> anyhow::Result<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::mem::forget(tx);
+    run_loop(Arc::new(AtomicBool::new(true)), rx)
 }

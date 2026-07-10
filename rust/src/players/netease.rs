@@ -69,6 +69,8 @@ pub struct NetEase {
     playlist_path: PathBuf,
     /// title mode: cache enrichment keyed by song name (avoids re-hitting disk/API).
     enrich_cache: RefCell<Option<(String, Enrichment)>>,
+    /// memory mode: cache full track metadata keyed by song id.
+    meta_cache: RefCell<Option<(String, FullTrack)>>,
     /// title mode: play-aware position (advances only while playing, resets per song).
     progress: RefCell<Option<TitleProgress>>,
     /// title mode: throttled cache of the last audio play/pause check.
@@ -122,6 +124,7 @@ impl NetEase {
             source,
             playlist_path,
             enrich_cache: RefCell::new(None),
+            meta_cache: RefCell::new(None),
             progress: RefCell::new(None),
             last_audio: RefCell::new(None),
         })
@@ -131,32 +134,48 @@ impl NetEase {
 
     fn read_from_memory(&self, audio_player: usize, schedule_ptr: usize) -> Option<PlayerInfo> {
         let status = self.mem.read_i32(audio_player + 0x60).ok()?;
-        diag!("[netease] status={status}");
         if status == STATUS_WAITING {
             return None;
         }
 
         let id = current_song_id(&self.mem, audio_player)?;
-        diag!("[netease] current song id = {id:?}");
         if id.is_empty() {
             return None;
         }
 
-        let track = track_by_id(&self.playlist_path, &id)?;
+        let (title, artists, album, cover) = match self.track_by_id_cached(&id) {
+            Some(track) => (track.title, track.artists, track.album, track.cover),
+            None => {
+                // Still publish a presence from memory state when metadata is unavailable
+                // (playlist miss + API failure) rather than clearing Discord entirely.
+                diag!("[netease] no metadata for id {id}; showing id-only presence");
+                (format!("Song {id}"), String::new(), String::new(), String::new())
+            }
+        };
 
-        let info = PlayerInfo {
+        Some(PlayerInfo {
             identity: id.clone(),
-            title: track.title,
-            artists: track.artists,
-            album: track.album,
-            cover: track.cover,
+            title,
+            artists,
+            album,
+            cover,
             duration: self.mem.read_f64(audio_player + 0xA8).ok()?,
             schedule: self.mem.read_f64(schedule_ptr).ok()?,
             paused: status == STATUS_PAUSED,
             url: format!("https://music.163.com/#/song?id={id}"),
-        };
-        diag!("[netease] {info:?}");
-        Some(info)
+        })
+    }
+
+    /// Resolve track metadata by id, cached so we don't re-read the playlist every tick.
+    fn track_by_id_cached(&self, id: &str) -> Option<FullTrack> {
+        if let Some((cached_id, track)) = &*self.meta_cache.borrow() {
+            if cached_id == id {
+                return Some(track.clone());
+            }
+        }
+        let track = track_by_id(&self.playlist_path, id)?;
+        *self.meta_cache.borrow_mut() = Some((id.to_string(), track.clone()));
+        Some(track)
     }
 
     // --- title mode (32-bit) ---
@@ -187,7 +206,7 @@ impl NetEase {
             format!("https://music.163.com/#/song?id={}", enrich.id)
         };
 
-        let info = PlayerInfo {
+        Some(PlayerInfo {
             identity: enrich.id,
             title: song,
             artists,
@@ -197,9 +216,7 @@ impl NetEase {
             schedule,
             paused,
             url,
-        };
-        diag!("[netease] (title) {info:?}");
-        Some(info)
+        })
     }
 
     /// Whether NetEase is currently outputting audio (throttled so we don't query
@@ -320,6 +337,7 @@ fn local_appdata() -> PathBuf {
 
 // --- metadata resolution ---
 
+#[derive(Clone)]
 struct FullTrack {
     title: String,
     artists: String,
@@ -366,20 +384,13 @@ fn enrich_by_name(path: &Path, song: &str) -> Option<Enrichment> {
 fn enrich_by_search(song: &str, artists: &str) -> Option<Enrichment> {
     let query = url_encode(&format!("{song} {artists}"));
     let url = format!(
-        "http://music.163.com/api/search/get/web?type=1&offset=0&limit=1&s={query}"
+        "https://music.163.com/api/search/get/web?type=1&offset=0&limit=1&s={query}"
     );
     diag!("[netease] web API search GET {url}");
 
-    let resp = minreq::get(&url)
-        .with_header("Referer", "http://music.163.com/")
-        .with_header("User-Agent", "Mozilla/5.0")
-        .with_timeout(5)
-        .send()
-        .map_err(|e| diag!("[netease] search request failed: {e}"))
-        .ok()?;
-    let body = resp.as_str().ok()?;
+    let body = crate::platform::http::https_get_ok(&url)?;
 
-    let parsed: SearchResp = serde_json::from_str(body)
+    let parsed: SearchResp = serde_json::from_str(&body)
         .map_err(|e| {
             let preview: String = body.chars().take(200).collect();
             diag!("[netease] search parse error: {e}; body: {preview}")
@@ -407,19 +418,12 @@ fn enrich_by_search(song: &str, artists: &str) -> Option<Enrichment> {
 
 /// NetEase song-detail API by id → full track.
 fn api_detail(id: &str) -> Option<FullTrack> {
-    let url = format!("http://music.163.com/api/song/detail/?id={id}&ids=%5B{id}%5D");
+    let url = format!("https://music.163.com/api/song/detail/?id={id}&ids=%5B{id}%5D");
     diag!("[netease] web API detail GET {url}");
 
-    let resp = minreq::get(&url)
-        .with_header("Referer", "http://music.163.com/")
-        .with_header("User-Agent", "Mozilla/5.0")
-        .with_timeout(5)
-        .send()
-        .map_err(|e| diag!("[netease] detail request failed: {e}"))
-        .ok()?;
-    let body = resp.as_str().ok()?;
+    let body = crate::platform::http::https_get_ok(&url)?;
 
-    let parsed: DetailResp = serde_json::from_str(body)
+    let parsed: DetailResp = serde_json::from_str(&body)
         .map_err(|e| {
             let preview: String = body.chars().take(200).collect();
             diag!("[netease] detail parse error: {e}; body: {preview}")
