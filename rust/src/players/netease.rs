@@ -32,15 +32,10 @@ const AUDIO_SCHEDULE_PATTERN: &str = "66 0F 2E 0D ? ? ? ? 7A ? 75 ? 66 0F 2E 15"
 const STATUS_WAITING: i32 = 0;
 const STATUS_PAUSED: i32 = 2;
 
-/// The precise 64-bit reader's resolved pointers.
-struct MemorySource {
-    mem: ProcessMemory,
-    audio_player: usize,
-    schedule_ptr: usize,
-}
-
 enum Source {
-    Memory(MemorySource),
+    /// Precise 64-bit reader: resolved AudioPlayer + Schedule pointers.
+    Memory { audio_player: usize, schedule_ptr: usize },
+    /// 32-bit / fallback: song from window title, position from an auto-found clock.
     Title,
 }
 
@@ -63,12 +58,26 @@ struct Enrichment {
 
 pub struct NetEase {
     pid: u32,
+    mem: ProcessMemory,
+    base: usize,
+    size: usize,
     source: Source,
     playlist_path: PathBuf,
     /// title mode: cache enrichment keyed by song name (avoids re-hitting disk/API).
     enrich_cache: RefCell<Option<(String, Enrichment)>>,
+    /// title mode fallback: approximate progress from when the title changed.
     progress: RefCell<Option<TitleProgress>>,
+    /// title mode: auto-discovered playback-clock address, once found.
+    clock: RefCell<Option<usize>>,
+    /// title mode: failed discovery attempts (we stop trying after a few).
+    clock_fails: RefCell<u32>,
+    /// title mode: last (position, instant) for pause detection.
+    pause_tracker: RefCell<Option<(f64, Instant)>>,
 }
+
+/// How many times to attempt playback-clock discovery before giving up and
+/// using approximate progress (each attempt blocks ~2.4s while scanning).
+const CLOCK_MAX_ATTEMPTS: u32 = 3;
 
 impl NetEase {
     pub fn new(pid: u32) -> anyhow::Result<Self> {
@@ -76,13 +85,12 @@ impl NetEase {
         diag!("[netease] cloudmusic.dll base=0x{base:X} size=0x{size:X} pid={pid}");
 
         let mem = ProcessMemory::open(pid)?;
-        let wow64 = mem.is_wow64();
 
-        let source = match wow64 {
-            Some(false) => match build_memory_source(mem, base) {
-                Ok(ms) => {
+        let source = match mem.is_wow64() {
+            Some(false) => match resolve_memory_pointers(&mem, base) {
+                Ok((audio_player, schedule_ptr)) => {
                     diag!("[netease] 64-bit client: using precise in-memory reader");
-                    Source::Memory(ms)
+                    Source::Memory { audio_player, schedule_ptr }
                 }
                 Err(e) => {
                     diag!("[netease] 64-bit pattern setup failed ({e}); using window-title reader");
@@ -91,7 +99,7 @@ impl NetEase {
             },
             _ => {
                 diag!(
-                    "[netease] 32-bit client: using window-title reader \
+                    "[netease] 32-bit client: using window-title reader + memory-scanned clock \
                      (the memory patterns are x64-only)"
                 );
                 Source::Title
@@ -108,23 +116,29 @@ impl NetEase {
 
         Ok(Self {
             pid,
+            mem,
+            base,
+            size,
             source,
             playlist_path,
             enrich_cache: RefCell::new(None),
             progress: RefCell::new(None),
+            clock: RefCell::new(None),
+            clock_fails: RefCell::new(0),
+            pause_tracker: RefCell::new(None),
         })
     }
 
     // --- memory mode (64-bit) ---
 
-    fn read_from_memory(&self, ms: &MemorySource) -> Option<PlayerInfo> {
-        let status = ms.mem.read_i32(ms.audio_player + 0x60).ok()?;
+    fn read_from_memory(&self, audio_player: usize, schedule_ptr: usize) -> Option<PlayerInfo> {
+        let status = self.mem.read_i32(audio_player + 0x60).ok()?;
         diag!("[netease] status={status}");
         if status == STATUS_WAITING {
             return None;
         }
 
-        let id = current_song_id(&ms.mem, ms.audio_player)?;
+        let id = current_song_id(&self.mem, audio_player)?;
         diag!("[netease] current song id = {id:?}");
         if id.is_empty() {
             return None;
@@ -138,8 +152,8 @@ impl NetEase {
             artists: track.artists,
             album: track.album,
             cover: track.cover,
-            duration: ms.mem.read_f64(ms.audio_player + 0xA8).ok()?,
-            schedule: ms.mem.read_f64(ms.schedule_ptr).ok()?,
+            duration: self.mem.read_f64(audio_player + 0xA8).ok()?,
+            schedule: self.mem.read_f64(schedule_ptr).ok()?,
             paused: status == STATUS_PAUSED,
             url: format!("https://music.163.com/#/song?id={id}"),
         };
@@ -160,21 +174,20 @@ impl NetEase {
             return None;
         }
 
-        // Approximate position: seconds since this title first appeared.
-        let elapsed = {
-            let mut guard = self.progress.borrow_mut();
-            match guard.as_ref() {
-                Some(p) if p.title == title => p.started.elapsed().as_secs_f64(),
-                _ => {
-                    *guard = Some(TitleProgress { title: title.clone(), started: Instant::now() });
-                    0.0
-                }
-            }
-        };
-
         let enrich = self.enrich(&song, &artists);
         let duration = enrich.duration;
-        let schedule = if duration > 0.0 { elapsed.min(duration) } else { elapsed };
+
+        // Prefer the real playback clock (accurate position + pause detection);
+        // fall back to approximate title timing if it couldn't be found.
+        let (schedule, paused) = match self.clock_address(duration) {
+            Some(addr) => {
+                let value = self.mem.read_f64(addr).unwrap_or(0.0).max(0.0);
+                let paused = self.detect_pause(value);
+                let sched = if duration > 0.0 { value.min(duration) } else { value };
+                (sched, paused)
+            }
+            None => (self.approx_elapsed(&title, duration), false),
+        };
 
         let url = if enrich.id.is_empty() {
             "https://music.163.com/".to_string()
@@ -190,11 +203,74 @@ impl NetEase {
             cover: enrich.cover,
             duration,
             schedule,
-            paused: false, // the title alone can't tell us play/pause
+            paused,
             url,
         };
         diag!("[netease] (title) {info:?}");
         Some(info)
+    }
+
+    /// Return the auto-discovered playback-clock address, running discovery (a
+    /// ~2.4s blocking scan) if needed. Retries a few times across reads before
+    /// giving up and letting the caller fall back to approximate progress.
+    fn clock_address(&self, duration: f64) -> Option<usize> {
+        if let Some(addr) = *self.clock.borrow() {
+            return Some(addr);
+        }
+        if *self.clock_fails.borrow() >= CLOCK_MAX_ATTEMPTS {
+            return None;
+        }
+
+        match self.mem.find_playback_clock(self.base, self.size, duration) {
+            Some(addr) => {
+                *self.clock.borrow_mut() = Some(addr);
+                Some(addr)
+            }
+            None => {
+                let mut fails = self.clock_fails.borrow_mut();
+                *fails += 1;
+                diag!(
+                    "[netease] clock not found (attempt {}/{}); \
+                     is a song actually playing? using approximate position for now",
+                    *fails,
+                    CLOCK_MAX_ATTEMPTS
+                );
+                None
+            }
+        }
+    }
+
+    /// Pause detection for title mode: the clock value not advancing between
+    /// reads (while wall-clock time passed) means playback is paused.
+    fn detect_pause(&self, value: f64) -> bool {
+        let now = Instant::now();
+        let mut guard = self.pause_tracker.borrow_mut();
+        let paused = match *guard {
+            Some((last_value, last_time)) => {
+                let dt = now.duration_since(last_time).as_secs_f64();
+                dt > 0.15 && (value - last_value) < 0.03
+            }
+            None => false,
+        };
+        *guard = Some((value, now));
+        paused
+    }
+
+    /// Fallback progress: seconds since the window title last changed.
+    fn approx_elapsed(&self, title: &str, duration: f64) -> f64 {
+        let mut guard = self.progress.borrow_mut();
+        let elapsed = match guard.as_ref() {
+            Some(p) if p.title == title => p.started.elapsed().as_secs_f64(),
+            _ => {
+                *guard = Some(TitleProgress { title: title.to_string(), started: Instant::now() });
+                0.0
+            }
+        };
+        if duration > 0.0 {
+            elapsed.min(duration)
+        } else {
+            elapsed
+        }
     }
 
     /// Resolve cover/album/duration/id for a title-mode song, cached by name.
@@ -223,14 +299,17 @@ impl MusicPlayer for NetEase {
     }
 
     fn player_info(&self) -> Option<PlayerInfo> {
-        match &self.source {
-            Source::Memory(ms) => self.read_from_memory(ms),
+        match self.source {
+            Source::Memory { audio_player, schedule_ptr } => {
+                self.read_from_memory(audio_player, schedule_ptr)
+            }
             Source::Title => self.read_from_title(),
         }
     }
 }
 
-fn build_memory_source(mem: ProcessMemory, base: usize) -> anyhow::Result<MemorySource> {
+/// Resolve the AudioPlayer + Schedule pointers via AOB pattern scan (64-bit only).
+fn resolve_memory_pointers(mem: &ProcessMemory, base: usize) -> anyhow::Result<(usize, usize)> {
     let app_match = mem
         .find_pattern(AUDIO_PLAYER_PATTERN, base)?
         .ok_or_else(|| anyhow::anyhow!("AudioPlayer pattern not found"))?;
@@ -246,7 +325,7 @@ fn build_memory_source(mem: ProcessMemory, base: usize) -> anyhow::Result<Memory
     let schedule_ptr = (text2 as isize + disp2 as isize + 4) as usize;
 
     diag!("[netease] audio_player=0x{audio_player:X} schedule=0x{schedule_ptr:X}");
-    Ok(MemorySource { mem, audio_player, schedule_ptr })
+    Ok((audio_player, schedule_ptr))
 }
 
 fn current_song_id(mem: &ProcessMemory, audio_player: usize) -> Option<String> {

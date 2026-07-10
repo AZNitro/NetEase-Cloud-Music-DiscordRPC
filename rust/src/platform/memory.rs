@@ -3,6 +3,8 @@
 //! [`ProcessMemory`] owns its handle and closes it on `Drop`.
 
 use std::io;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
@@ -95,6 +97,92 @@ impl ProcessMemory {
             return None;
         }
         Some(wow64 != 0)
+    }
+
+    /// Best-effort read of a whole region into one buffer; unreadable chunks are
+    /// left as zeros (so they simply won't match anything in a scan).
+    pub fn read_region_best_effort(&self, base: usize, size: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; size];
+        let chunk = 0x40000usize; // 256 KiB
+        let mut off = 0usize;
+        while off < size {
+            let len = chunk.min(size - off);
+            if let Ok(bytes) = self.read_bytes(base + off, len) {
+                let n = bytes.len().min(len);
+                buf[off..off + n].copy_from_slice(&bytes[..n]);
+            }
+            off += len;
+        }
+        buf
+    }
+
+    /// Auto-discover the playback-position "clock" without any version-specific
+    /// offset: a `double` within `[0, duration]` that advances ~1.0 per real
+    /// second. Returns its absolute address. Requires the song to be **playing**
+    /// during the ~2.4s scan; returns `None` if nothing behaves like a clock.
+    pub fn find_playback_clock(&self, base: usize, size: usize, duration: f64) -> Option<usize> {
+        let dur_max = if duration > 0.0 { duration + 2.0 } else { 100_000.0 };
+        crate::diag!(
+            "[clock] scanning 0x{base:X}..+0x{size:X} for a playback clock (duration={duration:.1})"
+        );
+
+        let a = self.read_region_best_effort(base, size);
+        let t0 = Instant::now();
+        sleep(Duration::from_millis(1200));
+        let b = self.read_region_best_effort(base, size);
+        let dt = t0.elapsed().as_secs_f64();
+
+        let limit = a.len().min(b.len());
+        let mut candidates = Vec::new();
+        let mut i = 0usize;
+        while i + 8 <= limit {
+            let va = f64::from_le_bytes(a[i..i + 8].try_into().unwrap());
+            let vb = f64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+            if va.is_finite() && vb.is_finite() && va >= 0.0 && va <= dur_max {
+                let delta = vb - va;
+                if delta > 0.0 && (delta - dt).abs() < dt * 0.4 {
+                    candidates.push(base + i);
+                }
+            }
+            i += 4; // doubles are at least 4-byte aligned in a 32-bit image
+        }
+        crate::diag!("[clock] round 1: {} candidate(s) (dt={dt:.2}s)", candidates.len());
+
+        match candidates.len() {
+            0 => None,
+            1 => {
+                crate::diag!("[clock] schedule found at 0x{:X}", candidates[0]);
+                Some(candidates[0])
+            }
+            _ => {
+                // Disambiguate with a second timed round.
+                let before: Vec<f64> = candidates
+                    .iter()
+                    .map(|&a| self.read_f64(a).unwrap_or(f64::NAN))
+                    .collect();
+                let t1 = Instant::now();
+                sleep(Duration::from_millis(1200));
+                let dt2 = t1.elapsed().as_secs_f64();
+
+                let mut survivor = None;
+                for (idx, &addr) in candidates.iter().enumerate() {
+                    let after = self.read_f64(addr).unwrap_or(f64::NAN);
+                    let bef = before[idx];
+                    if bef.is_finite() && after.is_finite() {
+                        let delta = after - bef;
+                        if delta > 0.0 && (delta - dt2).abs() < dt2 * 0.4 && after <= dur_max {
+                            survivor = Some(addr);
+                            break;
+                        }
+                    }
+                }
+                match survivor {
+                    Some(a) => crate::diag!("[clock] schedule found at 0x{a:X} (after round 2)"),
+                    None => crate::diag!("[clock] round 2 eliminated all candidates"),
+                }
+                survivor
+            }
+        }
     }
 
     /// Scan the `.text` section of the module based at `module_base` for an AOB
