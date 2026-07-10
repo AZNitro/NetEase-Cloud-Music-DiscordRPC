@@ -1,5 +1,7 @@
 //! The poll loop. Port of `Program.UpdateThread`, with the fixes noted in
-//! `RUST_PORT_PLAN.md` (correct PID in the QQ Music branch; owned handles).
+//! `RUST_PORT_PLAN.md` plus: it remembers failed readers so a broken player
+//! doesn't re-init (and re-log) every tick, and it logs the detected window
+//! title so we can see what metadata the window itself exposes.
 
 use std::thread::sleep;
 use std::time::Duration;
@@ -23,6 +25,13 @@ enum Kind {
     Tencent,
 }
 
+/// Cached per-(kind,pid) reader state. `Failed` is remembered so we don't retry
+/// (and spam the log) every tick for a player we already couldn't attach to.
+enum Cached {
+    Reader(Box<dyn MusicPlayer>),
+    Failed,
+}
+
 pub fn run() -> anyhow::Result<()> {
     crate::logging::init();
     diag!("MusicRpc starting (console diagnostic build)");
@@ -32,60 +41,52 @@ pub fn run() -> anyhow::Result<()> {
     netease_rpc.ensure_connected();
     tencent_rpc.ensure_connected();
 
-    // Cached reader: (kind, pid, reader). Reused across ticks while the PID holds.
-    let mut cached: Option<(Kind, u32, Box<dyn MusicPlayer>)> = None;
-    // Which client currently shows a presence, so we can clear the right one.
+    let mut cached: Option<(Kind, u32, Cached)> = None;
     let mut last_rpc: Option<Kind> = None;
-    // Last detection result, logged only on change to avoid per-tick spam.
-    let mut last_seen: Option<Option<Kind>> = None;
+    let mut last_detect: Option<(Kind, u32, String)> = None;
 
     loop {
-        let target = if let Some((_title, pid)) = find_by_class(NETEASE_CLASS) {
-            Some((Kind::NetEase, pid))
-        } else if let Some((_title, pid)) = find_by_class(TENCENT_CLASS) {
-            Some((Kind::Tencent, pid))
-        } else {
-            None
-        };
+        let target = detect();
 
-        let seen = target.map(|(k, _)| k);
-        if last_seen != Some(seen) {
-            match seen {
-                Some(k) => diag!("[loop] detected {k:?} player window"),
+        // Log detection changes only (kind / pid / title), so the log stays readable.
+        if last_detect != target {
+            match &target {
+                Some((k, pid, title)) => {
+                    diag!("[loop] detected {k:?} window pid={pid} title={title:?}")
+                }
                 None => diag!("[loop] no player window found (waiting)"),
             }
-            last_seen = Some(seen);
+            last_detect = target.clone();
         }
 
-        let Some((kind, pid)) = target else {
-            // No player window: drop the cached reader and leave presence as-is
-            // (matches the original behaviour).
+        let Some((kind, pid, _title)) = target else {
             cached = None;
             sleep(POLL);
             continue;
         };
 
-        let reuse = matches!(&cached, Some((k, _, p)) if *k == kind && p.validate(pid));
-        if !reuse {
-            diag!("[loop] creating {kind:?} reader for pid {pid}");
-            let created: anyhow::Result<Box<dyn MusicPlayer>> = match kind {
-                Kind::NetEase => NetEase::new(pid).map(|p| Box::new(p) as Box<dyn MusicPlayer>),
-                Kind::Tencent => Tencent::new(pid).map(|p| Box::new(p) as Box<dyn MusicPlayer>),
-            };
-            match created {
-                Ok(p) => cached = Some((kind, pid, p)),
+        // (Re)build the reader only when the (kind, pid) is new.
+        let fresh = !matches!(&cached, Some((k, p, _)) if *k == kind && *p == pid);
+        if fresh {
+            match build_reader(kind, pid) {
+                Ok(r) => cached = Some((kind, pid, Cached::Reader(r))),
                 Err(e) => {
-                    diag!("[loop] failed to init {kind:?}: {e:#}");
-                    cached = None;
-                    sleep(POLL);
-                    continue;
+                    diag!("[loop] failed to init {kind:?} (pid {pid}): {e:#}");
+                    cached = Some((kind, pid, Cached::Failed));
                 }
             }
         }
 
-        let info = cached.as_ref().and_then(|(_, _, p)| p.player_info());
+        let reader = match &cached {
+            Some((_, _, Cached::Reader(r))) => r,
+            // Failed (or somehow empty): stay quiet until the window/pid changes.
+            _ => {
+                sleep(POLL);
+                continue;
+            }
+        };
 
-        match info {
+        match reader.player_info() {
             None => {
                 if let Some(k) = last_rpc.take() {
                     diag!("[loop] no track info; clearing {k:?} presence");
@@ -95,7 +96,6 @@ pub fn run() -> anyhow::Result<()> {
             Some(info) => {
                 let rpc = rpc_for(kind, &mut netease_rpc, &mut tencent_rpc);
                 if info.paused {
-                    diag!("[loop] paused; clearing {kind:?} presence");
                     rpc.clear();
                 } else {
                     rpc.update(&info);
@@ -105,6 +105,23 @@ pub fn run() -> anyhow::Result<()> {
         }
 
         sleep(POLL);
+    }
+}
+
+fn detect() -> Option<(Kind, u32, String)> {
+    if let Some((title, pid)) = find_by_class(NETEASE_CLASS) {
+        Some((Kind::NetEase, pid, title))
+    } else if let Some((title, pid)) = find_by_class(TENCENT_CLASS) {
+        Some((Kind::Tencent, pid, title))
+    } else {
+        None
+    }
+}
+
+fn build_reader(kind: Kind, pid: u32) -> anyhow::Result<Box<dyn MusicPlayer>> {
+    match kind {
+        Kind::NetEase => Ok(Box::new(NetEase::new(pid)?)),
+        Kind::Tencent => Ok(Box::new(Tencent::new(pid)?)),
     }
 }
 
