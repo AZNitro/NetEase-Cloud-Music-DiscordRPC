@@ -56,24 +56,36 @@ impl Rpc {
         }
 
         let start = now_unix() - info.schedule as i64;
-        let end = start + info.duration as i64;
+
+        // With a known duration, show a start→end progress bar; otherwise show a
+        // count-up timer (start only) so an approximate position still displays.
+        let timestamps = if info.duration > 0.0 {
+            Timestamps::new().start(start).end(start + info.duration as i64)
+        } else {
+            Timestamps::new().start(start)
+        };
 
         let details = format!("🎵 {}", info.title);
         let state = format!("🎤 {}", info.artists);
         let album = format!("💿 {}", info.album);
 
+        // Discord requires a non-empty image key; fall back to the bundled asset.
+        let large_image = if info.cover.is_empty() { "timg" } else { info.cover.as_str() };
+
+        let mut assets = Assets::new()
+            .large_image(large_image)
+            .small_image("timg")
+            .small_text("NetEase CloudMusic");
+        if !info.album.is_empty() {
+            assets = assets.large_text(&album);
+        }
+
         let activity = Activity::new()
             .activity_type(ActivityType::Listening)
             .details(&details)
             .state(&state)
-            .timestamps(Timestamps::new().start(start).end(end))
-            .assets(
-                Assets::new()
-                    .large_image(&info.cover)
-                    .large_text(&album)
-                    .small_image("timg")
-                    .small_text("NetEase CloudMusic"),
-            )
+            .timestamps(timestamps)
+            .assets(assets)
             .buttons(vec![
                 Button::new("🎧 Listen", &info.url),
                 Button::new("👏 View App on GitHub", GITHUB_URL),

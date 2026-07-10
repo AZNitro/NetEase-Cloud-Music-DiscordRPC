@@ -16,11 +16,18 @@ for the full design.
 - Unit tests for the AOB pattern scanner pass (`cargo test`).
 - No clippy warnings.
 
-For NetEase, track **metadata** (title/artist/album/cover) is resolved
-local-playlist-first, then falls back to the **NetEase web API** by song id if the
-on-disk `playingList` file doesn't have it. Playback **position/status** still come
-from the desktop app's memory — a cloud API can't know how far into a song you are.
-The API path uses plain HTTP and needs live testing (see below).
+The NetEase reader auto-selects a mode by client bitness:
+
+- **64-bit client → memory mode:** precise position/status from `cloudmusic.dll`
+  memory (AOB pattern scan), metadata from the local playlist / web API by song id.
+- **32-bit client → title mode:** `Song - Artist` is read straight from the
+  `OrpheusBrowserHost` window title (version-independent). Cover/album/duration are
+  filled in from the local playlist (matched by name) or the NetEase web API search.
+  Position is approximated from when the title last changed (no exact seek/pause,
+  since the title can't report them).
+
+The web API path uses plain HTTP and is best-effort — if it fails, the presence
+still shows song + artist.
 
 The one thing that **cannot** be verified without a Windows machine running the music
 apps + Discord is whether the memory offsets/patterns read correctly on your build.

@@ -1,15 +1,20 @@
-//! NetEase Cloud Music reader.
+//! NetEase Cloud Music reader with two modes, chosen automatically:
 //!
-//! Playback *state* (status / song id / position / duration) is always read from
-//! the desktop app's `cloudmusic.dll` memory — only the running app knows how far
-//! into a song you are. Track *metadata* (title/artists/album/cover) is resolved
-//! by song id, preferring the desktop app's on-disk `playingList` JSON and
-//! **falling back to NetEase's web API** when the file doesn't have it.
+//! * **Memory mode** (64-bit client): the precise reader — AOB pattern scan of
+//!   `cloudmusic.dll` for the AudioPlayer + Schedule, exact position/status, song
+//!   id from memory, metadata from the on-disk playlist / web API.
+//! * **Title mode** (32-bit client, or if the patterns don't resolve): reads
+//!   `Song - Artist` straight from the `OrpheusBrowserHost` window title — which
+//!   is version-independent — and enriches cover/album/duration from the local
+//!   playlist (matched by name) or the NetEase web API. Progress is approximated
+//!   from when the title last changed.
 //!
-//! Port of `Vanessa/Players/NetEase.cs` (target is 64-bit), plus the API fallback.
+//! The 64-bit patterns are x64 machine code and cannot match a 32-bit client, so
+//! title mode is what makes the 32-bit client work at all.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use serde::Deserialize;
 
@@ -17,31 +22,52 @@ use super::MusicPlayer;
 use crate::diag;
 use crate::model::PlayerInfo;
 use crate::platform::memory::{module_base_size, read_std_string_x64, ProcessMemory};
+use crate::platform::window::find_by_class;
+
+const NETEASE_CLASS: &str = "OrpheusBrowserHost";
 
 const AUDIO_PLAYER_PATTERN: &str = "48 8D 0D ? ? ? ? E8 ? ? ? ? 48 8D 0D ? ? ? ? E8 ? ? ? ? 90 48 8D 0D ? ? ? ? E8 ? ? ? ? 48 8D 05 ? ? ? ? 48 8D A5 ? ? ? ? 5F 5D C3 CC CC CC CC CC 48 89 4C 24 ? 55 57 48 81 EC ? ? ? ? 48 8D 6C 24 ? 48 8D 7C 24";
 const AUDIO_SCHEDULE_PATTERN: &str = "66 0F 2E 0D ? ? ? ? 7A ? 75 ? 66 0F 2E 15";
 
-// PlayStatus (read at audio_player + 0x60): 0 Waiting, 1 Playing, 2 Paused.
 const STATUS_WAITING: i32 = 0;
 const STATUS_PAUSED: i32 = 2;
 
-#[derive(Clone)]
-struct TrackMeta {
+/// The precise 64-bit reader's resolved pointers.
+struct MemorySource {
+    mem: ProcessMemory,
+    audio_player: usize,
+    schedule_ptr: usize,
+}
+
+enum Source {
+    Memory(MemorySource),
+    Title,
+}
+
+/// Tracks when the current window title first appeared, to approximate playback
+/// position in title mode.
+struct TitleProgress {
     title: String,
-    artists: String,
+    started: Instant,
+}
+
+/// Extra metadata resolved for a title-mode song (title/artist come from the
+/// window title; this fills in the rest).
+#[derive(Clone, Default)]
+struct Enrichment {
+    id: String,
     album: String,
     cover: String,
+    duration: f64,
 }
 
 pub struct NetEase {
     pid: u32,
-    mem: ProcessMemory,
-    audio_player: usize,
-    schedule_ptr: usize,
+    source: Source,
     playlist_path: PathBuf,
-    /// Cache of the last resolved metadata, keyed by song id, so we read the JSON
-    /// file / call the API only once per song change (not every 233 ms tick).
-    meta_cache: RefCell<Option<(String, TrackMeta)>>,
+    /// title mode: cache enrichment keyed by song name (avoids re-hitting disk/API).
+    enrich_cache: RefCell<Option<(String, Enrichment)>>,
+    progress: RefCell<Option<TitleProgress>>,
 }
 
 impl NetEase {
@@ -50,33 +76,27 @@ impl NetEase {
         diag!("[netease] cloudmusic.dll base=0x{base:X} size=0x{size:X} pid={pid}");
 
         let mem = ProcessMemory::open(pid)?;
+        let wow64 = mem.is_wow64();
 
-        match mem.is_wow64() {
-            Some(true) => diag!(
-                "[netease] WARNING: target is a 32-bit (WOW64) process — the 64-bit \
-                 AudioPlayer/Schedule patterns are written for the x64 client and will not match"
-            ),
-            Some(false) => diag!("[netease] target process is 64-bit (native)"),
-            None => diag!("[netease] could not determine target bitness"),
-        }
-
-        // AudioPlayer: `lea rcx, [rip+disp32]` — resolve the RIP-relative target.
-        let app_match = mem
-            .find_pattern(AUDIO_PLAYER_PATTERN, base)?
-            .ok_or_else(|| anyhow::anyhow!("AudioPlayer pattern not found"))?;
-        let text = app_match + 3;
-        let disp = mem.read_i32(text)?;
-        let audio_player = (text as isize + disp as isize + 4) as usize;
-        diag!("[netease] AudioPlayer match=0x{app_match:X} disp={disp} ptr=0x{audio_player:X}");
-
-        // Schedule: `ucomisd xmm1, [rip+disp32]`.
-        let asp_match = mem
-            .find_pattern(AUDIO_SCHEDULE_PATTERN, base)?
-            .ok_or_else(|| anyhow::anyhow!("Schedule pattern not found"))?;
-        let text2 = asp_match + 4;
-        let disp2 = mem.read_i32(text2)?;
-        let schedule_ptr = (text2 as isize + disp2 as isize + 4) as usize;
-        diag!("[netease] Schedule match=0x{asp_match:X} disp={disp2} ptr=0x{schedule_ptr:X}");
+        let source = match wow64 {
+            Some(false) => match build_memory_source(mem, base) {
+                Ok(ms) => {
+                    diag!("[netease] 64-bit client: using precise in-memory reader");
+                    Source::Memory(ms)
+                }
+                Err(e) => {
+                    diag!("[netease] 64-bit pattern setup failed ({e}); using window-title reader");
+                    Source::Title
+                }
+            },
+            _ => {
+                diag!(
+                    "[netease] 32-bit client: using window-title reader \
+                     (the memory patterns are x64-only)"
+                );
+                Source::Title
+            }
+        };
 
         let playlist_path = local_appdata()
             .join("NetEase")
@@ -88,85 +108,112 @@ impl NetEase {
 
         Ok(Self {
             pid,
-            mem,
-            audio_player,
-            schedule_ptr,
+            source,
             playlist_path,
-            meta_cache: RefCell::new(None),
+            enrich_cache: RefCell::new(None),
+            progress: RefCell::new(None),
         })
     }
 
-    fn status(&self) -> Option<i32> {
-        self.mem.read_i32(self.audio_player + 0x60).ok()
-    }
+    // --- memory mode (64-bit) ---
 
-    fn duration(&self) -> Option<f64> {
-        self.mem.read_f64(self.audio_player + 0xA8).ok()
-    }
-
-    fn schedule(&self) -> Option<f64> {
-        self.mem.read_f64(self.schedule_ptr).ok()
-    }
-
-    fn current_song_id(&self) -> Option<String> {
-        let info = self.mem.read_i64(self.audio_player + 0x50).ok()?;
-        if info == 0 {
-            return Some(String::new());
-        }
-        let str_base = info as usize + 0x10;
-        let s = read_std_string_x64(&self.mem, str_base)?;
-        // The stored id looks like "<id>_<something>"; keep the part before '_'.
-        Some(s.split('_').next().unwrap_or("").to_string())
-    }
-
-    /// Resolve metadata for `id`: cache → local playlist JSON → NetEase web API.
-    fn metadata_for(&self, id: &str) -> Option<TrackMeta> {
-        if let Some((cached_id, meta)) = &*self.meta_cache.borrow() {
-            if cached_id == id {
-                return Some(meta.clone());
-            }
-        }
-
-        let meta = if let Some(m) = from_local_playlist(&self.playlist_path, id) {
-            diag!("[netease] metadata source: local playlist ({id})");
-            m
-        } else {
-            diag!("[netease] local playlist has no id {id}; falling back to web API");
-            from_web_api(id)?
-        };
-
-        *self.meta_cache.borrow_mut() = Some((id.to_string(), meta.clone()));
-        Some(meta)
-    }
-
-    fn read_info(&self) -> Option<PlayerInfo> {
-        let status = self.status()?;
+    fn read_from_memory(&self, ms: &MemorySource) -> Option<PlayerInfo> {
+        let status = ms.mem.read_i32(ms.audio_player + 0x60).ok()?;
         diag!("[netease] status={status}");
         if status == STATUS_WAITING {
             return None;
         }
 
-        let id = self.current_song_id()?;
+        let id = current_song_id(&ms.mem, ms.audio_player)?;
         diag!("[netease] current song id = {id:?}");
         if id.is_empty() {
             return None;
         }
 
-        let meta = self.metadata_for(&id)?;
+        let track = track_by_id(&self.playlist_path, &id)?;
 
         let info = PlayerInfo {
             identity: id.clone(),
-            title: meta.title,
-            artists: meta.artists,
-            album: meta.album,
-            cover: meta.cover,
-            duration: self.duration()?,
-            schedule: self.schedule()?,
+            title: track.title,
+            artists: track.artists,
+            album: track.album,
+            cover: track.cover,
+            duration: ms.mem.read_f64(ms.audio_player + 0xA8).ok()?,
+            schedule: ms.mem.read_f64(ms.schedule_ptr).ok()?,
             paused: status == STATUS_PAUSED,
             url: format!("https://music.163.com/#/song?id={id}"),
         };
         diag!("[netease] {info:?}");
         Some(info)
+    }
+
+    // --- title mode (32-bit) ---
+
+    fn read_from_title(&self) -> Option<PlayerInfo> {
+        let (title, _pid) = find_by_class(NETEASE_CLASS)?;
+        if title.trim().is_empty() {
+            return None;
+        }
+
+        let (song, artists) = parse_title(&title);
+        if song.is_empty() {
+            return None;
+        }
+
+        // Approximate position: seconds since this title first appeared.
+        let elapsed = {
+            let mut guard = self.progress.borrow_mut();
+            match guard.as_ref() {
+                Some(p) if p.title == title => p.started.elapsed().as_secs_f64(),
+                _ => {
+                    *guard = Some(TitleProgress { title: title.clone(), started: Instant::now() });
+                    0.0
+                }
+            }
+        };
+
+        let enrich = self.enrich(&song, &artists);
+        let duration = enrich.duration;
+        let schedule = if duration > 0.0 { elapsed.min(duration) } else { elapsed };
+
+        let url = if enrich.id.is_empty() {
+            "https://music.163.com/".to_string()
+        } else {
+            format!("https://music.163.com/#/song?id={}", enrich.id)
+        };
+
+        let info = PlayerInfo {
+            identity: enrich.id,
+            title: song,
+            artists,
+            album: enrich.album,
+            cover: enrich.cover,
+            duration,
+            schedule,
+            paused: false, // the title alone can't tell us play/pause
+            url,
+        };
+        diag!("[netease] (title) {info:?}");
+        Some(info)
+    }
+
+    /// Resolve cover/album/duration/id for a title-mode song, cached by name.
+    fn enrich(&self, song: &str, artists: &str) -> Enrichment {
+        if let Some((name, e)) = &*self.enrich_cache.borrow() {
+            if name == song {
+                return e.clone();
+            }
+        }
+
+        let enrich = enrich_by_name(&self.playlist_path, song)
+            .or_else(|| {
+                diag!("[netease] '{song}' not in local playlist; trying web API search");
+                enrich_by_search(song, artists)
+            })
+            .unwrap_or_default();
+
+        *self.enrich_cache.borrow_mut() = Some((song.to_string(), enrich.clone()));
+        enrich
     }
 }
 
@@ -176,7 +223,48 @@ impl MusicPlayer for NetEase {
     }
 
     fn player_info(&self) -> Option<PlayerInfo> {
-        self.read_info()
+        match &self.source {
+            Source::Memory(ms) => self.read_from_memory(ms),
+            Source::Title => self.read_from_title(),
+        }
+    }
+}
+
+fn build_memory_source(mem: ProcessMemory, base: usize) -> anyhow::Result<MemorySource> {
+    let app_match = mem
+        .find_pattern(AUDIO_PLAYER_PATTERN, base)?
+        .ok_or_else(|| anyhow::anyhow!("AudioPlayer pattern not found"))?;
+    let text = app_match + 3;
+    let disp = mem.read_i32(text)?;
+    let audio_player = (text as isize + disp as isize + 4) as usize;
+
+    let asp_match = mem
+        .find_pattern(AUDIO_SCHEDULE_PATTERN, base)?
+        .ok_or_else(|| anyhow::anyhow!("Schedule pattern not found"))?;
+    let text2 = asp_match + 4;
+    let disp2 = mem.read_i32(text2)?;
+    let schedule_ptr = (text2 as isize + disp2 as isize + 4) as usize;
+
+    diag!("[netease] audio_player=0x{audio_player:X} schedule=0x{schedule_ptr:X}");
+    Ok(MemorySource { mem, audio_player, schedule_ptr })
+}
+
+fn current_song_id(mem: &ProcessMemory, audio_player: usize) -> Option<String> {
+    let info = mem.read_i64(audio_player + 0x50).ok()?;
+    if info == 0 {
+        return Some(String::new());
+    }
+    let str_base = info as usize + 0x10;
+    let s = read_std_string_x64(mem, str_base)?;
+    Some(s.split('_').next().unwrap_or("").to_string())
+}
+
+/// Split a `Song - Artist` window title. Splits on the first " - " (NetEase uses
+/// it as the song/artist separator; multiple artists are joined with "/").
+fn parse_title(title: &str) -> (String, String) {
+    match title.split_once(" - ") {
+        Some((song, artist)) => (song.trim().to_string(), artist.trim().to_string()),
+        None => (title.trim().to_string(), String::new()),
     }
 }
 
@@ -186,54 +274,116 @@ fn local_appdata() -> PathBuf {
         .unwrap_or_default()
 }
 
-/// Look the song up in the desktop app's on-disk playlist cache.
-fn from_local_playlist(path: &Path, id: &str) -> Option<TrackMeta> {
-    let json = std::fs::read_to_string(path).ok()?;
-    let playlist: NetEasePlaylist = serde_json::from_str(&json).ok()?;
-    let item = playlist.list.iter().find(|x| x.id == id)?;
-    let track = item.track.as_ref()?;
-    Some(TrackMeta {
-        title: track.name.clone(),
-        artists: join_names(track.artists.iter().map(|a| a.name.as_str())),
-        album: track.album.name.clone(),
-        cover: track.album.cover.clone(),
+// --- metadata resolution ---
+
+struct FullTrack {
+    title: String,
+    artists: String,
+    album: String,
+    cover: String,
+}
+
+/// Memory-mode: full track from the on-disk playlist by id, then web API by id.
+fn track_by_id(path: &Path, id: &str) -> Option<FullTrack> {
+    if let Some(t) = playlist_track(path, |item| item.id == id) {
+        diag!("[netease] metadata source: local playlist (id {id})");
+        return Some(t);
+    }
+    diag!("[netease] id {id} not in local playlist; trying web API");
+    api_detail(id).map(|d| FullTrack {
+        title: d.title,
+        artists: d.artists,
+        album: d.album,
+        cover: d.cover,
     })
 }
 
-/// Fallback: fetch song detail from NetEase's public web API by id.
-///
-/// Uses plain HTTP so the crate stays TLS-free and cross-compilable. If a network
-/// forces HTTPS this will log a failure; adding minreq's `https` feature is the fix.
-fn from_web_api(id: &str) -> Option<TrackMeta> {
-    let url = format!("http://music.163.com/api/song/detail/?id={id}&ids=%5B{id}%5D");
-    diag!("[netease] web API GET {url}");
+/// Title-mode: enrichment (id/album/cover/duration) from the local playlist,
+/// matched by song name.
+fn enrich_by_name(path: &Path, song: &str) -> Option<Enrichment> {
+    let json = std::fs::read_to_string(path).ok()?;
+    let playlist: NetEasePlaylist = serde_json::from_str(&json).ok()?;
+    let item = playlist
+        .list
+        .iter()
+        .find(|it| it.track.as_ref().is_some_and(|t| t.name == song))?;
+    let track = item.track.as_ref()?;
+    diag!("[netease] enrichment source: local playlist ('{song}')");
+    Some(Enrichment {
+        id: item.id.clone(),
+        album: track.album.name.clone(),
+        cover: track.album.cover.clone(),
+        duration: track.duration.map(|ms| ms * 0.001).unwrap_or(0.0),
+    })
+}
+
+/// Title-mode fallback: search the NetEase web API by `song artist`. Best-effort
+/// — any failure returns `None` and the presence still shows song + artist.
+fn enrich_by_search(song: &str, artists: &str) -> Option<Enrichment> {
+    let query = url_encode(&format!("{song} {artists}"));
+    let url = format!(
+        "http://music.163.com/api/search/get/web?type=1&offset=0&limit=1&s={query}"
+    );
+    diag!("[netease] web API search GET {url}");
 
     let resp = minreq::get(&url)
         .with_header("Referer", "http://music.163.com/")
         .with_header("User-Agent", "Mozilla/5.0")
         .with_timeout(5)
-        .send();
-
-    let resp = match resp {
-        Ok(r) => r,
-        Err(e) => {
-            diag!("[netease] web API request failed: {e}");
-            return None;
-        }
-    };
-
+        .send()
+        .map_err(|e| diag!("[netease] search request failed: {e}"))
+        .ok()?;
     let body = resp.as_str().ok()?;
-    let parsed: ApiResponse = match serde_json::from_str(body) {
-        Ok(p) => p,
-        Err(e) => {
+
+    let parsed: SearchResp = serde_json::from_str(body)
+        .map_err(|e| {
             let preview: String = body.chars().take(200).collect();
-            diag!("[netease] web API parse error: {e}; body starts: {preview}");
-            return None;
-        }
+            diag!("[netease] search parse error: {e}; body: {preview}")
+        })
+        .ok()?;
+
+    let song0 = parsed.result?.songs.into_iter().next()?;
+    let id = song0.id.to_string();
+
+    // The search result's album often lacks a cover; fetch song detail for it.
+    let (album, cover) = match &song0.album {
+        Some(a) if !a.pic_url.is_empty() => (a.name.clone(), a.pic_url.clone()),
+        _ => api_detail(&id)
+            .map(|d| (d.album, d.cover))
+            .unwrap_or_default(),
     };
+
+    Some(Enrichment {
+        id,
+        album,
+        cover,
+        duration: song0.duration as f64 * 0.001,
+    })
+}
+
+/// NetEase song-detail API by id → full track.
+fn api_detail(id: &str) -> Option<FullTrack> {
+    let url = format!("http://music.163.com/api/song/detail/?id={id}&ids=%5B{id}%5D");
+    diag!("[netease] web API detail GET {url}");
+
+    let resp = minreq::get(&url)
+        .with_header("Referer", "http://music.163.com/")
+        .with_header("User-Agent", "Mozilla/5.0")
+        .with_timeout(5)
+        .send()
+        .map_err(|e| diag!("[netease] detail request failed: {e}"))
+        .ok()?;
+    let body = resp.as_str().ok()?;
+
+    let parsed: DetailResp = serde_json::from_str(body)
+        .map_err(|e| {
+            let preview: String = body.chars().take(200).collect();
+            diag!("[netease] detail parse error: {e}; body: {preview}")
+        })
+        .ok()?;
 
     let song = parsed.songs.into_iter().next()?;
-    Some(TrackMeta {
+    Some(FullTrack {
         title: song.name,
         artists: join_names(song.artists.iter().map(|a| a.name.as_str())),
         album: song.album.name,
@@ -241,8 +391,36 @@ fn from_web_api(id: &str) -> Option<TrackMeta> {
     })
 }
 
+/// Load and search the playlist for a matching item, returning its full track.
+fn playlist_track(path: &Path, pred: impl Fn(&NetEasePlaylistItem) -> bool) -> Option<FullTrack> {
+    let json = std::fs::read_to_string(path).ok()?;
+    let playlist: NetEasePlaylist = serde_json::from_str(&json).ok()?;
+    let item = playlist.list.iter().find(|it| pred(it))?;
+    let track = item.track.as_ref()?;
+    Some(FullTrack {
+        title: track.name.clone(),
+        artists: join_names(track.artists.iter().map(|a| a.name.as_str())),
+        album: track.album.name.clone(),
+        cover: track.album.cover.clone(),
+    })
+}
+
 fn join_names<'a>(names: impl Iterator<Item = &'a str>) -> String {
     names.collect::<Vec<_>>().join(",")
+}
+
+/// Minimal percent-encoding for a query string (RFC 3986 unreserved kept as-is).
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 // --- on-disk playlist JSON ---
@@ -265,6 +443,9 @@ struct NetEaseTrack {
     #[serde(default)]
     artists: Vec<NetEaseArtist>,
     album: NetEaseAlbum,
+    /// Track length in milliseconds, when present.
+    #[serde(default)]
+    duration: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -278,20 +459,27 @@ struct NetEaseAlbum {
     cover: String,
 }
 
-// --- web API JSON (music.163.com/api/song/detail) ---
+// --- web API JSON ---
 
 #[derive(Deserialize)]
-struct ApiResponse {
+struct DetailResp {
     #[serde(default)]
-    songs: Vec<ApiSong>,
+    songs: Vec<DetailSong>,
 }
 
 #[derive(Deserialize)]
-struct ApiSong {
+struct DetailSong {
     name: String,
     #[serde(default)]
     artists: Vec<ApiArtist>,
-    album: ApiAlbum,
+    album: DetailAlbum,
+}
+
+#[derive(Deserialize)]
+struct DetailAlbum {
+    name: String,
+    #[serde(rename = "picUrl", default)]
+    pic_url: String,
 }
 
 #[derive(Deserialize)]
@@ -300,7 +488,27 @@ struct ApiArtist {
 }
 
 #[derive(Deserialize)]
-struct ApiAlbum {
+struct SearchResp {
+    result: Option<SearchResult>,
+}
+
+#[derive(Deserialize)]
+struct SearchResult {
+    #[serde(default)]
+    songs: Vec<SearchSong>,
+}
+
+#[derive(Deserialize)]
+struct SearchSong {
+    id: i64,
+    album: Option<SearchAlbum>,
+    #[serde(default)]
+    duration: i64,
+}
+
+#[derive(Deserialize)]
+struct SearchAlbum {
+    #[serde(default)]
     name: String,
     #[serde(rename = "picUrl", default)]
     pic_url: String,
