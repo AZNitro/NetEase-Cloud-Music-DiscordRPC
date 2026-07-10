@@ -241,8 +241,15 @@ impl ProcessMemory {
             CAP >> 20
         );
 
-        // Snapshot A of each region (bounded by CAP).
-        let mut snaps: Vec<(usize, Vec<u8>)> = Vec::new();
+        // Reading ~hundreds of MB takes ~1s, comparable to the sleep, so the real
+        // elapsed time per region varies. Timestamp each region's A read, and time
+        // its B read too, so the advance test uses the *actual* elapsed per region.
+        let advances = |sa: f64, sb: f64, dt: f64| {
+            dt > 0.3 && sa >= 0.0 && sa <= dur_max && (sb - sa) > 0.0 && ((sb - sa) - dt).abs() < dt * 0.35
+        };
+
+        // Snapshot A of each region (bounded by CAP), each with a read timestamp.
+        let mut snaps: Vec<(usize, Vec<u8>, Instant)> = Vec::new();
         let mut used = 0usize;
         for (rbase, rsize) in regions {
             if used >= CAP {
@@ -250,22 +257,18 @@ impl ProcessMemory {
                 break;
             }
             let sz = rsize.min(CAP - used);
-            snaps.push((rbase, self.read_region_best_effort(rbase, sz)));
+            let buf = self.read_region_best_effort(rbase, sz);
+            snaps.push((rbase, buf, Instant::now()));
             used += sz;
         }
 
-        let t0 = Instant::now();
         sleep(Duration::from_millis(1200));
-        let dt = t0.elapsed().as_secs_f64();
-
-        let advances = |sa: f64, sb: f64, dt: f64| {
-            sa >= 0.0 && sa <= dur_max && (sb - sa) > 0.0 && ((sb - sa) - dt).abs() < dt * 0.4
-        };
 
         let mut candidates: Vec<(usize, ClockFormat)> = Vec::new();
         let mut per_format = [0usize; CLOCK_FORMATS.len()];
-        for (rbase, a) in &snaps {
+        for (rbase, a, ta) in &snaps {
             let b = self.read_region_best_effort(*rbase, a.len());
+            let dt = Instant::now().duration_since(*ta).as_secs_f64();
             let limit = a.len().min(b.len());
             let mut i = 0usize;
             while i + 4 <= limit {
@@ -289,24 +292,24 @@ impl ProcessMemory {
                 crate::diag!("[clock] round 1: {} candidate(s) as {fmt:?}", per_format[fi]);
             }
         }
-        crate::diag!("[clock] round 1: {} candidate(s) total (dt={dt:.2}s)", candidates.len());
+        crate::diag!("[clock] round 1: {} candidate(s) total", candidates.len());
         if candidates.is_empty() {
             return None;
         }
 
         // Disambiguate with a second timed round; keep the best-tracking survivor.
-        let before: Vec<f64> = candidates
+        // Timestamp each candidate read so the elapsed time is per-candidate accurate.
+        let before: Vec<(f64, Instant)> = candidates
             .iter()
-            .map(|&(addr, fmt)| self.read_clock_seconds(addr, fmt).unwrap_or(f64::NAN))
+            .map(|&(addr, fmt)| (self.read_clock_seconds(addr, fmt).unwrap_or(f64::NAN), Instant::now()))
             .collect();
-        let t1 = Instant::now();
         sleep(Duration::from_millis(1200));
-        let dt2 = t1.elapsed().as_secs_f64();
 
         let mut survivors: Vec<(usize, ClockFormat, f64, f64)> = Vec::new(); // addr, fmt, value, rate error
         for (idx, &(addr, fmt)) in candidates.iter().enumerate() {
+            let (bef, tb) = before[idx];
             let after = self.read_clock_seconds(addr, fmt).unwrap_or(f64::NAN);
-            let bef = before[idx];
+            let dt2 = Instant::now().duration_since(tb).as_secs_f64();
             if bef.is_finite() && after.is_finite() && advances(bef, after, dt2) {
                 survivors.push((addr, fmt, after, ((after - bef) - dt2).abs()));
             }
