@@ -59,8 +59,6 @@ struct Enrichment {
 pub struct NetEase {
     pid: u32,
     mem: ProcessMemory,
-    base: usize,
-    size: usize,
     source: Source,
     playlist_path: PathBuf,
     /// title mode: cache enrichment keyed by song name (avoids re-hitting disk/API).
@@ -117,8 +115,6 @@ impl NetEase {
         Ok(Self {
             pid,
             mem,
-            base,
-            size,
             source,
             playlist_path,
             enrich_cache: RefCell::new(None),
@@ -221,7 +217,7 @@ impl NetEase {
             return None;
         }
 
-        match self.mem.find_playback_clock(self.base, self.size, duration) {
+        match self.mem.find_playback_clock(duration) {
             Some(found) => {
                 *self.clock.borrow_mut() = Some(found);
                 Some(found)

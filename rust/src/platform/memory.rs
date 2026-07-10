@@ -173,65 +173,128 @@ impl ProcessMemory {
         }
     }
 
+    /// Enumerate committed, readable+writable regions of the target's address
+    /// space (where a mutable playback clock would live), as `(base, size)`.
+    fn enumerate_writable_regions(&self) -> Vec<(usize, usize)> {
+        use windows_sys::Win32::System::Memory::{
+            VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE,
+            PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE, PAGE_WRITECOPY,
+        };
+
+        let mut regions = Vec::new();
+        let mut addr: usize = 0;
+        let max_addr: usize = 0xFFFF_FFFF; // 32-bit user space (large-address-aware)
+
+        loop {
+            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { core::mem::zeroed() };
+            let ret = unsafe {
+                VirtualQueryEx(
+                    self.handle,
+                    addr as *const core::ffi::c_void,
+                    &mut mbi,
+                    core::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            if ret == 0 {
+                break;
+            }
+
+            let region_base = mbi.BaseAddress as usize;
+            let region_size = mbi.RegionSize;
+            if region_size == 0 {
+                break;
+            }
+
+            let writable = mbi.Protect
+                & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
+                != 0;
+            let inaccessible = mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS) != 0;
+            if mbi.State == MEM_COMMIT && writable && !inaccessible {
+                regions.push((region_base, region_size));
+            }
+
+            match region_base.checked_add(region_size) {
+                Some(next) if next > addr && next <= max_addr => addr = next,
+                _ => break,
+            }
+        }
+
+        regions
+    }
+
     /// Auto-discover the playback-position "clock" without any version-specific
     /// offset: a value that, read as some common numeric format, sits within
-    /// `[0, duration]` seconds and advances ~1.0 per real second. Tries `double`,
-    /// `float`, and `int32`, in both seconds and milliseconds. Returns the address
-    /// and the format that fit. Requires the song to be **playing** during the
-    /// ~2.4s scan; returns `None` if nothing behaves like a clock.
-    pub fn find_playback_clock(
-        &self,
-        base: usize,
-        size: usize,
-        duration: f64,
-    ) -> Option<(usize, ClockFormat)> {
+    /// `[0, duration]` seconds and advances ~1.0 per real second. Scans **all**
+    /// writable process memory (the clock lives on the heap, not in the module),
+    /// trying `double`/`float`/`int32` in seconds and milliseconds. Requires the
+    /// song to be **playing** during the ~5s scan; returns `None` if nothing fits.
+    pub fn find_playback_clock(&self, duration: f64) -> Option<(usize, ClockFormat)> {
+        const CAP: usize = 512 * 1024 * 1024; // bound memory/time for the scan
         let dur_max = if duration > 0.0 { duration + 2.0 } else { 100_000.0 };
+
+        let regions = self.enumerate_writable_regions();
+        let total: usize = regions.iter().map(|&(_, s)| s).sum();
         crate::diag!(
-            "[clock] scanning 0x{base:X}..+0x{size:X} for a playback clock (duration={duration:.1})"
+            "[clock] {} writable region(s), {} MiB committed; scanning up to {} MiB (a few seconds)",
+            regions.len(),
+            total >> 20,
+            CAP >> 20
         );
 
-        let a = self.read_region_best_effort(base, size);
+        // Snapshot A of each region (bounded by CAP).
+        let mut snaps: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut used = 0usize;
+        for (rbase, rsize) in regions {
+            if used >= CAP {
+                crate::diag!("[clock] reached {} MiB cap; higher memory not scanned", CAP >> 20);
+                break;
+            }
+            let sz = rsize.min(CAP - used);
+            snaps.push((rbase, self.read_region_best_effort(rbase, sz)));
+            used += sz;
+        }
+
         let t0 = Instant::now();
         sleep(Duration::from_millis(1200));
-        let b = self.read_region_best_effort(base, size);
         let dt = t0.elapsed().as_secs_f64();
 
         let advances = |sa: f64, sb: f64, dt: f64| {
             sa >= 0.0 && sa <= dur_max && (sb - sa) > 0.0 && ((sb - sa) - dt).abs() < dt * 0.4
         };
 
-        let limit = a.len().min(b.len());
         let mut candidates: Vec<(usize, ClockFormat)> = Vec::new();
         let mut per_format = [0usize; CLOCK_FORMATS.len()];
-        let mut i = 0usize;
-        while i + 4 <= limit {
-            for (fi, &fmt) in CLOCK_FORMATS.iter().enumerate() {
-                if let (Some(sa), Some(sb)) = (extract_seconds(&a, i, fmt), extract_seconds(&b, i, fmt))
-                {
-                    if advances(sa, sb, dt) {
-                        candidates.push((base + i, fmt));
-                        per_format[fi] += 1;
+        for (rbase, a) in &snaps {
+            let b = self.read_region_best_effort(*rbase, a.len());
+            let limit = a.len().min(b.len());
+            let mut i = 0usize;
+            while i + 4 <= limit {
+                for (fi, &fmt) in CLOCK_FORMATS.iter().enumerate() {
+                    if let (Some(sa), Some(sb)) =
+                        (extract_seconds(a, i, fmt), extract_seconds(&b, i, fmt))
+                    {
+                        if advances(sa, sb, dt) {
+                            candidates.push((rbase + i, fmt));
+                            per_format[fi] += 1;
+                        }
                     }
                 }
+                i += 4;
             }
-            i += 4;
         }
+        drop(snaps);
+
         for (fi, &fmt) in CLOCK_FORMATS.iter().enumerate() {
             if per_format[fi] > 0 {
                 crate::diag!("[clock] round 1: {} candidate(s) as {fmt:?}", per_format[fi]);
             }
         }
         crate::diag!("[clock] round 1: {} candidate(s) total (dt={dt:.2}s)", candidates.len());
-
         if candidates.is_empty() {
             return None;
         }
-        if candidates.len() == 1 {
-            crate::diag!("[clock] schedule found at 0x{:X} as {:?}", candidates[0].0, candidates[0].1);
-            return Some(candidates[0]);
-        }
 
-        // Disambiguate with a second timed round.
+        // Disambiguate with a second timed round; keep the best-tracking survivor.
         let before: Vec<f64> = candidates
             .iter()
             .map(|&(addr, fmt)| self.read_clock_seconds(addr, fmt).unwrap_or(f64::NAN))
@@ -240,20 +303,27 @@ impl ProcessMemory {
         sleep(Duration::from_millis(1200));
         let dt2 = t1.elapsed().as_secs_f64();
 
-        let mut survivor = None;
+        let mut survivors: Vec<(usize, ClockFormat, f64, f64)> = Vec::new(); // addr, fmt, value, rate error
         for (idx, &(addr, fmt)) in candidates.iter().enumerate() {
             let after = self.read_clock_seconds(addr, fmt).unwrap_or(f64::NAN);
             let bef = before[idx];
             if bef.is_finite() && after.is_finite() && advances(bef, after, dt2) {
-                survivor = Some((addr, fmt));
-                break;
+                survivors.push((addr, fmt, after, ((after - bef) - dt2).abs()));
             }
         }
-        match survivor {
-            Some((a, f)) => crate::diag!("[clock] schedule found at 0x{a:X} as {f:?} (after round 2)"),
-            None => crate::diag!("[clock] round 2 eliminated all {} candidates", candidates.len()),
+        crate::diag!("[clock] round 2: {} survivor(s)", survivors.len());
+        for &(addr, fmt, value, _) in survivors.iter().take(8) {
+            crate::diag!("[clock]   0x{addr:X} {fmt:?} = {value:.2}s");
         }
-        survivor
+
+        // Best = the one whose rate tracks real time most precisely.
+        survivors
+            .iter()
+            .min_by(|a, b| a.3.total_cmp(&b.3))
+            .map(|&(addr, fmt, _, _)| {
+                crate::diag!("[clock] using 0x{addr:X} as {fmt:?}");
+                (addr, fmt)
+            })
     }
 
     /// Scan the `.text` section of the module based at `module_base` for an AOB
