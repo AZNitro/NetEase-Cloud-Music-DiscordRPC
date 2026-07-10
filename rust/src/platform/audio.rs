@@ -6,7 +6,11 @@
 //! Everything returns `None` on any failure, so a transient COM error is treated
 //! as "unknown" (the caller assumes playing) and never looks like a false pause.
 
+use std::thread::sleep;
+use std::time::Duration;
+
 use windows::core::Interface;
+use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
 use windows::Win32::Media::Audio::{
     eConsole, eRender, AudioSessionStateActive, IAudioSessionControl2, IAudioSessionEnumerator,
     IAudioSessionManager2, IMMDeviceEnumerator, MMDeviceEnumerator,
@@ -16,6 +20,9 @@ use windows::Win32::System::Com::{
 };
 
 use crate::diag;
+
+/// Audio peak above this counts as "producing sound" (paused playback reads ~0).
+const PEAK_THRESHOLD: f64 = 0.0005;
 
 thread_local! {
     static COM_READY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -35,9 +42,9 @@ fn ensure_com() {
 }
 
 /// `Some(true)` if any render audio session owned by a process whose executable
-/// name contains `name_substr` (case-insensitive) is *Active* (producing audio);
-/// `Some(false)` if such sessions exist but none are active (paused); `None` if
-/// none are found or the query fails.
+/// name contains `name_substr` (case-insensitive) is actually producing sound
+/// (peak level above threshold); `Some(false)` if such sessions exist but are all
+/// silent (paused); `None` if none are found or the query fails.
 pub fn any_active_session(name_substr: &str) -> Option<bool> {
     ensure_com();
     match query(name_substr) {
@@ -58,27 +65,69 @@ fn query(name_substr: &str) -> windows::core::Result<Option<bool>> {
         let sessions: IAudioSessionEnumerator = manager.GetSessionEnumerator()?;
         let count = sessions.GetCount()?;
 
-        let mut found = false;
-        let mut any_active = false;
+        let mut matched = false;
+        let mut producing_sound = false;
+        let mut other_names: Vec<String> = Vec::new();
+
         for i in 0..count {
             let control = sessions.GetSession(i)?;
             let control2: IAudioSessionControl2 = control.cast()?;
             let pid = control2.GetProcessId().unwrap_or(0);
-            if pid == 0 {
-                continue;
-            }
-            let name = process_image_name(pid).unwrap_or_default().to_ascii_lowercase();
+            let name = if pid != 0 {
+                process_image_name(pid).unwrap_or_default().to_ascii_lowercase()
+            } else {
+                String::new()
+            };
+
             if !name.contains(name_substr) {
+                if !name.is_empty() {
+                    other_names.push(name);
+                }
                 continue;
             }
-            found = true;
-            if control.GetState()? == AudioSessionStateActive {
-                any_active = true;
-            }
+
+            matched = true;
+            let active = control.GetState()? == AudioSessionStateActive;
+            // Peak level is the reliable pause signal: a paused session reads ~0
+            // even if its state stays "Active".
+            let peak = match control.cast::<IAudioMeterInformation>() {
+                Ok(meter) => sample_peak(&meter),
+                Err(_) => None,
+            };
+            let playing = match peak {
+                Some(p) => p > PEAK_THRESHOLD,
+                None => active, // no meter available; fall back to session state
+            };
+            producing_sound |= playing;
+            diag!(
+                "[audio] pid={pid} '{name}' state={} peak={} -> {}",
+                if active { "Active" } else { "Inactive" },
+                peak.map(|p| format!("{p:.4}")).unwrap_or_else(|| "n/a".into()),
+                if playing { "playing" } else { "paused" }
+            );
         }
 
-        Ok(found.then_some(any_active))
+        if !matched {
+            diag!("[audio] no '{name_substr}' session among {count}; names seen: {other_names:?}");
+            return Ok(None);
+        }
+        Ok(Some(producing_sound))
     }
+}
+
+/// Read the session peak a few times over ~45ms and return the max, so a brief
+/// zero-crossing during playback isn't mistaken for silence.
+unsafe fn sample_peak(meter: &IAudioMeterInformation) -> Option<f64> {
+    let mut max = 0.0f32;
+    let mut ok = false;
+    for _ in 0..3 {
+        if let Ok(p) = meter.GetPeakValue() {
+            max = max.max(p);
+            ok = true;
+        }
+        sleep(Duration::from_millis(15));
+    }
+    ok.then_some(max as f64)
 }
 
 /// The executable file name (e.g. `cloudmusic.exe`) of a process, lowercased by
