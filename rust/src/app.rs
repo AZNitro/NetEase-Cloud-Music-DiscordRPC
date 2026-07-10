@@ -4,23 +4,26 @@
 
 use std::mem::{size_of, zeroed};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::System::Console::{
+    SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT,
+};
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
-    DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, LoadImageW, PostQuitMessage,
-    RegisterClassExW, SetForegroundWindow, TrackPopupMenu, TranslateMessage, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED,
+    DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, LoadImageW, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SetForegroundWindow, TrackPopupMenu, TranslateMessage,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED,
     MF_SEPARATOR, MF_STRING, MSG, TPM_LEFTALIGN, TPM_RIGHTBUTTON, TPM_RETURNCMD, WM_APP,
-    WM_COMMAND, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSEXW,
-    WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    WM_COMMAND, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSEXW, WS_EX_TOOLWINDOW,
+    WS_OVERLAPPED,
 };
 
 use crate::diag;
@@ -31,6 +34,9 @@ const WM_TRAY: u32 = WM_APP + 1;
 const ID_AUTOSTART: usize = 1001;
 const ID_EXIT: usize = 1002;
 
+/// Tray HWND for the Ctrl+C handler (posts Exit to the UI thread).
+static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
+
 struct TrayState {
     cmd_tx: Sender<Command>,
     running: Arc<AtomicBool>,
@@ -40,7 +46,7 @@ struct TrayState {
 /// Full application entry: single-instance → first-run auto-start → tray + worker.
 pub fn run() -> anyhow::Result<()> {
     crate::logging::init();
-    diag!("MusicRpc starting (tray build)");
+    diag!("MusicRpc starting (console + tray; Ctrl+C or tray Exit to quit)");
 
     let _lock = match instance::try_acquire() {
         Some(lock) => lock,
@@ -145,9 +151,13 @@ fn run_tray(running: Arc<AtomicBool>, cmd_tx: Sender<Command>) -> anyhow::Result
         );
     }
 
-    diag!("[app] tray icon ready");
+    TRAY_HWND.store(hwnd as isize, Ordering::SeqCst);
+    unsafe {
+        SetConsoleCtrlHandler(Some(console_ctrl_handler), 1);
+    }
+    diag!("[app] tray icon ready (Ctrl+C / tray Exit to quit)");
 
-    // Standard blocking message loop — exits on PostQuitMessage from Exit.
+    // Standard blocking message loop — exits on PostQuitMessage from Exit/Ctrl+C.
     unsafe {
         let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, ptr::null_mut(), 0, 0) > 0 {
@@ -156,7 +166,22 @@ fn run_tray(running: Arc<AtomicBool>, cmd_tx: Sender<Command>) -> anyhow::Result
         }
     }
 
+    TRAY_HWND.store(0, Ordering::SeqCst);
     Ok(())
+}
+
+unsafe extern "system" fn console_ctrl_handler(ctrl: u32) -> i32 {
+    match ctrl {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT => {
+            let hwnd = TRAY_HWND.load(Ordering::SeqCst) as HWND;
+            if !hwnd.is_null() {
+                // Route through the same Exit path as the tray menu.
+                PostMessageW(hwnd, WM_COMMAND, ID_EXIT as WPARAM, 0);
+            }
+            1 // handled — don't let the default handler kill us mid-clear
+        }
+        _ => 0,
+    }
 }
 
 fn write_tip(nid: &mut NOTIFYICONDATAW, tip: &str) {

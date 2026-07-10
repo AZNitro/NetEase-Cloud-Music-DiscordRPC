@@ -1,4 +1,6 @@
-#![windows_subsystem = "windows"]
+// Console subsystem so Ctrl+C works during testing. Tray Exit also quits.
+// (Switch back to windows_subsystem once you no longer need a console.)
+// #![windows_subsystem = "windows"]
 
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {

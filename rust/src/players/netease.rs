@@ -71,9 +71,17 @@ pub struct NetEase {
     enrich_cache: RefCell<Option<(String, Enrichment)>>,
     /// memory mode: cache full track metadata keyed by song id.
     meta_cache: RefCell<Option<(String, FullTrack)>>,
-    /// title mode: play-aware position (advances while the title is shown).
+    /// title mode: play-aware position (advances only while playing, resets per song).
     progress: RefCell<Option<TitleProgress>>,
+    /// title mode: throttled SMTC play/pause cache.
+    last_smtc: RefCell<Option<(Instant, bool)>>,
 }
+
+/// Match SMTC SourceAppUserModelId / exe-related ids containing this.
+const NETEASE_SMTC: &str = "cloudmusic";
+
+/// Re-query SMTC at most this often (ms).
+const SMTC_POLL_MS: u128 = 500;
 
 impl NetEase {
     pub fn new(pid: u32) -> anyhow::Result<Self> {
@@ -95,8 +103,8 @@ impl NetEase {
             },
             _ => {
                 diag!(
-                    "[netease] 32-bit client: using window-title reader \
-                     (the memory patterns are x64-only; pause via WASAPI is unreliable on this client)"
+                    "[netease] 32-bit client: using window-title reader + SMTC play/pause \
+                     (the memory patterns are x64-only)"
                 );
                 Source::Title
             }
@@ -118,6 +126,7 @@ impl NetEase {
             enrich_cache: RefCell::new(None),
             meta_cache: RefCell::new(None),
             progress: RefCell::new(None),
+            last_smtc: RefCell::new(None),
         })
     }
 
@@ -185,12 +194,11 @@ impl NetEase {
         let enrich = self.enrich(&song, &artists);
         let duration = enrich.duration;
 
-        // Title mode always reports playing while the window shows a song.
-        // WASAPI peak/Active is unreliable on Chromium NetEase (peak≈0 / flaky
-        // Inactive) and was clearing Discord presence entirely.
-        let playing = true;
+        // Play/pause from Windows SMTC (Now Playing). Unknown → assume playing
+        // so we never blank Discord the way WASAPI peak did.
+        let playing = self.playing_now();
         let schedule = self.advance_progress(&title, playing, duration);
-        let paused = false;
+        let paused = !playing;
 
         let url = if enrich.id.is_empty() {
             "https://music.163.com/".to_string()
@@ -211,8 +219,28 @@ impl NetEase {
         })
     }
 
-    /// Position for title mode: accumulates real time while the title is shown,
-    /// resets when `key` (the song) changes, and is capped at the track duration.
+    /// SMTC Playing status, throttled. On any uncertainty, assume playing.
+    fn playing_now(&self) -> bool {
+        let now = Instant::now();
+        if let Some((when, value)) = *self.last_smtc.borrow() {
+            if now.duration_since(when).as_millis() < SMTC_POLL_MS {
+                return value;
+            }
+        }
+
+        let value = crate::platform::smtc::netease_playing(NETEASE_SMTC)
+            .or_else(|| crate::platform::smtc::netease_playing("netease"))
+            .unwrap_or(true);
+
+        if self.last_smtc.borrow().as_ref().map(|(_, v)| *v) != Some(value) {
+            diag!("[netease] smtc playing={value}");
+        }
+        *self.last_smtc.borrow_mut() = Some((now, value));
+        value
+    }
+
+    /// Position for title mode: accumulates real time only while playing, resets
+    /// when `key` (the song) changes, and is capped at the track duration.
     fn advance_progress(&self, key: &str, playing: bool, duration: f64) -> f64 {
         let now = Instant::now();
         let mut guard = self.progress.borrow_mut();
