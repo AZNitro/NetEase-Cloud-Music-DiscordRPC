@@ -51,6 +51,15 @@ impl NetEase {
 
         let mem = ProcessMemory::open(pid)?;
 
+        match mem.is_wow64() {
+            Some(true) => diag!(
+                "[netease] WARNING: target is a 32-bit (WOW64) process — the 64-bit \
+                 AudioPlayer/Schedule patterns are written for the x64 client and will not match"
+            ),
+            Some(false) => diag!("[netease] target process is 64-bit (native)"),
+            None => diag!("[netease] could not determine target bitness"),
+        }
+
         // AudioPlayer: `lea rcx, [rip+disp32]` — resolve the RIP-relative target.
         let app_match = mem
             .find_pattern(AUDIO_PLAYER_PATTERN, base)?

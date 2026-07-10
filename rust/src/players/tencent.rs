@@ -39,6 +39,15 @@ impl Tencent {
 
         let mem = ProcessMemory::open(pid)?;
 
+        match mem.is_wow64() {
+            Some(true) => diag!("[tencent] target process is 32-bit (WOW64) — as expected"),
+            Some(false) => diag!(
+                "[tencent] WARNING: target is 64-bit, but the CurrentSongInfo pattern/offsets \
+                 assume the 32-bit client"
+            ),
+            None => diag!("[tencent] could not determine target bitness"),
+        }
+
         let m = mem
             .find_pattern(CURRENT_SONG_INFO_PATTERN, module_base)?
             .ok_or_else(|| anyhow::anyhow!("CurrentSongInfo pattern not found"))?;

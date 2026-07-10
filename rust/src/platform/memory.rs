@@ -11,7 +11,7 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     TH32CS_SNAPMODULE32,
 };
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+    IsWow64Process, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
 };
 
 use crate::pattern::{find_pattern_in, parse_signature};
@@ -84,6 +84,19 @@ impl ProcessMemory {
         Ok(f64::from_le_bytes(self.read_arr::<8>(addr)?))
     }
 
+    /// Is the target a 32-bit process running under WOW64? `Some(true)` means
+    /// 32-bit; `Some(false)` means native (64-bit on a 64-bit OS); `None` if the
+    /// query failed. This matters because the AOB patterns are bitness-specific.
+    pub fn is_wow64(&self) -> Option<bool> {
+        let mut wow64: i32 = 0;
+        // SAFETY: FFI; handle is valid, we own the out param.
+        let ok = unsafe { IsWow64Process(self.handle, &mut wow64) };
+        if ok == 0 {
+            return None;
+        }
+        Some(wow64 != 0)
+    }
+
     /// Scan the `.text` section of the module based at `module_base` for an AOB
     /// signature, returning the absolute address of the match.
     ///
@@ -94,24 +107,42 @@ impl ProcessMemory {
         let nt_header = module_base + nt_offset;
         let file_header = nt_header + 4;
 
+        // Machine field of IMAGE_FILE_HEADER: 0x8664 = x64, 0x14C = x86.
+        let machine = self.read_i16(file_header)? as u16;
         let sections = self.read_i16(nt_header + 6)? as usize; // NumberOfSections
         let opt_size = self.read_i16(file_header + 16)? as usize; // SizeOfOptionalHeader
         let opt_header = file_header + 20;
         let mut cursor = opt_header + opt_size; // first section header
 
-        for _ in 0..sections {
+        crate::diag!(
+            "[scan] machine=0x{machine:X} ({}) sections={sections} opt_hdr=0x{opt_size:X}",
+            machine_name(machine)
+        );
+
+        for i in 0..sections {
             let name = self.read_i64(cursor)?;
+            let virt_size = self.read_i32(cursor + 8)? as usize; // VirtualSize
+            let virt_addr = self.read_i32(cursor + 12)? as usize; // VirtualAddress (RVA)
+            crate::diag!(
+                "[scan] section[{i}] {:?} rva=0x{virt_addr:X} vsize=0x{virt_size:X}",
+                section_name(name)
+            );
+
             if name == DOT_TEXT {
-                let virt_size = self.read_i32(cursor + 8)? as usize; // VirtualSize
-                let virt_addr = self.read_i32(cursor + 12)? as usize; // VirtualAddress (RVA)
                 let start = module_base + virt_addr;
                 let block = self.read_bytes(start, virt_size)?;
                 let pat = parse_signature(signature);
-                return Ok(find_pattern_in(&block, &pat).map(|off| start + off));
+                let found = find_pattern_in(&block, &pat).map(|off| start + off);
+                crate::diag!(
+                    "[scan] .text @0x{start:X} read {} of 0x{virt_size:X} bytes; match={found:X?}",
+                    block.len()
+                );
+                return Ok(found);
             }
             cursor += 40; // sizeof(IMAGE_SECTION_HEADER)
         }
 
+        crate::diag!("[scan] no .text section found among {sections} sections");
         Ok(None)
     }
 }
@@ -194,4 +225,20 @@ pub fn module_base_size(pid: u32, module_name: &str) -> io::Result<(usize, usize
 fn u16_buf_to_string(buf: &[u16]) -> String {
     let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     String::from_utf16_lossy(&buf[..end])
+}
+
+/// Decode an 8-byte PE section name (read as a little-endian i64) to text.
+fn section_name(name_le: i64) -> String {
+    let bytes = name_le.to_le_bytes();
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+fn machine_name(machine: u16) -> &'static str {
+    match machine {
+        0x8664 => "x64",
+        0x014C => "x86",
+        0xAA64 => "arm64",
+        _ => "unknown",
+    }
 }
