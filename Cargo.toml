@@ -43,6 +43,10 @@ features = [
     "Win32_System_Com",
 ]
 
+# Build-time icon embedding (host = Windows only; a no-op elsewhere).
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
 [profile.release]
 opt-level = "z"
 lto = true

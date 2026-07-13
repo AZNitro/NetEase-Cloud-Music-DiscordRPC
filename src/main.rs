@@ -1,6 +1,7 @@
-// Console subsystem so Ctrl+C works during testing. Tray Exit also quits.
-// (Switch back to windows_subsystem once you no longer need a console.)
-// #![windows_subsystem = "windows"]
+// Silent tray app: no console window when double-clicked. Diagnostics still go to
+// music-rpc.log next to the exe. To debug with a live console + Ctrl+C, comment
+// this line out and rebuild.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {
