@@ -7,7 +7,7 @@ use discord_rich_presence::{DiscordIpc, DiscordIpcClient};
 use crate::diag;
 use crate::model::PlayerInfo;
 
-const GITHUB_URL: &str = "https://github.com/Kxnrl/NetEase-Cloud-Music-DiscordRPC";
+const GITHUB_URL: &str = "https://github.com/AZNitro/NetEase-Cloud-Music-DiscordRPC";
 
 pub struct Rpc {
     client: DiscordIpcClient,
